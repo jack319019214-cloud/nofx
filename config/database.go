@@ -407,7 +407,7 @@ type User struct {
 	ID           string    `json:"id"`
 	Email        string    `json:"email"`
 	PasswordHash string    `json:"-"` // 不返回到前端
-	OTPSecret    string    `json:"-"` // 不返回到前端
+	OTPSecret    *string   `json:"-"` // 不返回到前端，使用指针支持NULL值
 	OTPVerified  bool      `json:"otp_verified"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
@@ -519,7 +519,7 @@ func (d *Database) EnsureAdminUser() error {
 		ID:           "admin",
 		Email:        "admin@localhost",
 		PasswordHash: "", // 管理员模式下不使用密码
-		OTPSecret:    "",
+		OTPSecret:    nil, // 管理员模式下不需要OTP
 		OTPVerified:  true,
 	}
 

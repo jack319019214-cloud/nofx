@@ -1653,7 +1653,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 		ID:           userID,
 		Email:        req.Email,
 		PasswordHash: passwordHash,
-		OTPSecret:    otpSecret,
+		OTPSecret:    &otpSecret,
 		OTPVerified:  false,
 	}
 
@@ -1706,7 +1706,7 @@ func (s *Server) handleCompleteRegistration(c *gin.Context) {
 	}
 
 	// 验证OTP
-	if !auth.VerifyOTP(user.OTPSecret, req.OTPCode) {
+	if user.OTPSecret == nil || !auth.VerifyOTP(*user.OTPSecret, req.OTPCode) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "OTP验证码错误"})
 		return
 	}
@@ -1754,15 +1754,21 @@ func (s *Server) handleLogin(c *gin.Context) {
 	// 获取用户信息
 	user, err := s.database.GetUserByEmail(req.Email)
 	if err != nil {
+		log.Printf("❌ 登录失败 - 用户不存在: %s, 错误: %v", req.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
 		return
 	}
 
+	log.Printf("🔍 登录尝试 - 邮箱: %s, 密码长度: %d, Hash长度: %d", req.Email, len(req.Password), len(user.PasswordHash))
+
 	// 验证密码
 	if !auth.CheckPassword(req.Password, user.PasswordHash) {
+		log.Printf("❌ 登录失败 - 密码验证失败: %s", req.Email)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
 		return
 	}
+
+	log.Printf("✅ 密码验证成功: %s", req.Email)
 
 	// 检查OTP是否已验证
 	if !user.OTPVerified {
@@ -1770,6 +1776,24 @@ func (s *Server) handleLogin(c *gin.Context) {
 			"error":              "账户未完成OTP设置",
 			"user_id":            user.ID,
 			"requires_otp_setup": true,
+		})
+		return
+	}
+
+	// 如果OTP secret为空（管理员账户或已禁用OTP），直接签发token
+	if user.OTPSecret == nil || *user.OTPSecret == "" {
+		log.Printf("✅ OTP已禁用，直接签发JWT token: %s", user.Email)
+		token, err := auth.GenerateJWT(user.ID, user.Email)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "生成token失败"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"token":   token,
+			"user_id": user.ID,
+			"email":   user.Email,
+			"message": "登录成功",
 		})
 		return
 	}
@@ -1803,7 +1827,7 @@ func (s *Server) handleVerifyOTP(c *gin.Context) {
 	}
 
 	// 验证OTP
-	if !auth.VerifyOTP(user.OTPSecret, req.OTPCode) {
+	if user.OTPSecret == nil || !auth.VerifyOTP(*user.OTPSecret, req.OTPCode) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "验证码错误"})
 		return
 	}
@@ -1844,7 +1868,7 @@ func (s *Server) handleResetPassword(c *gin.Context) {
 	}
 
 	// 验证 OTP
-	if !auth.VerifyOTP(user.OTPSecret, req.OTPCode) {
+	if user.OTPSecret == nil || !auth.VerifyOTP(*user.OTPSecret, req.OTPCode) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Google Authenticator 验证码错误"})
 		return
 	}

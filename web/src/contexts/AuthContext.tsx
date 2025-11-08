@@ -106,6 +106,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             message: data.message,
           }
         }
+
+        // 登录成功且直接返回token（OTP已禁用或管理员账户）
+        if (data.token) {
+          const userInfo = {
+            id: data.user_id,
+            email: data.email,
+          }
+          setToken(data.token)
+          setUser(userInfo)
+          localStorage.setItem('auth_token', data.token)
+          localStorage.setItem('auth_user', JSON.stringify(userInfo))
+
+          // 跳转到仪表盘
+          window.history.pushState({}, '', '/dashboard')
+          window.dispatchEvent(new PopStateEvent('popstate'))
+
+          return {
+            success: true,
+            message: data.message || '登录成功',
+          }
+        }
       } else {
         return { success: false, message: data.error }
       }
