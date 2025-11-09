@@ -1,0 +1,1 @@
+find /root -name "trading.db" -> <no matches> (server 47.120.67.168, 2025-11-09)

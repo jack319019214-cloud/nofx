@@ -1,0 +1,14 @@
+total_files: 954
+close_long: 2
+close_short: 7
+empty: 518
+errors: 520
+hold: 377
+open_long: 3
+open_short: 14
+wait: 296
+
+error_samples:
+decision_20251105_144529_cycle1.json: 构建交易上下文失败: 获取账户余额失败: 获取账户信息失败: <APIError> code=-2015, msg=Invalid API-key, IP, or permissions for action
+decision_20251105_144829_cycle2.json: 构建交易上下文失败: 获取账户余额失败: 获取账户信息失败: <APIError> code=-2015, msg=Invalid API-key, IP, or permissions for action
+decision_20251105_145130_cycle3.json: 构建交易上下文失败: 获取账户余额失败: 获取账户信息失败: <APIError> code=-2015, msg=Invalid API-key, IP, or permissions for action

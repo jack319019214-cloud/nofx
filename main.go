@@ -203,7 +203,6 @@ func main() {
 	useDefaultCoins := useDefaultCoinsStr == "true"
 	apiPortStr, _ := database.GetSystemConfig("api_server_port")
 
-
 	// 设置JWT密钥（优先使用环境变量）
 	jwtSecret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
 	if jwtSecret == "" {
@@ -293,6 +292,46 @@ func main() {
 				trader.Name, strings.ToUpper(trader.AIModelID), strings.ToUpper(trader.ExchangeID),
 				trader.InitialBalance, status)
 		}
+	}
+
+	// 根据数据库标记自动启动交易员
+	autoStartCount := 0
+	userIDs, err := database.GetAllUsers()
+	if err != nil {
+		log.Printf("⚠️ 无法获取用户列表，跳过自动启动: %v", err)
+	} else {
+		for _, userID := range userIDs {
+			userTraders, err := database.GetTraders(userID)
+			if err != nil {
+				log.Printf("⚠️ 获取用户 %s 的交易员列表失败: %v", userID, err)
+				continue
+			}
+
+			for _, traderCfg := range userTraders {
+				if !traderCfg.IsRunning {
+					continue
+				}
+
+				autoTrader, err := traderManager.GetTrader(traderCfg.ID)
+				if err != nil {
+					log.Printf("⚠️ 无法自动启动交易员 %s: %v", traderCfg.Name, err)
+					continue
+				}
+
+				autoStartCount++
+				go func(name, id string, runner func() error) {
+					log.Printf("▶️ 自动启动交易员 %s (%s)", id, name)
+					if err := runner(); err != nil {
+						log.Printf("❌ 交易员 %s 运行错误: %v", name, err)
+					}
+				}(traderCfg.Name, traderCfg.ID, autoTrader.Run)
+			}
+		}
+	}
+	if autoStartCount > 0 {
+		log.Printf("🚀 已自动启动 %d 个交易员（根据运行状态标记）", autoStartCount)
+	} else {
+		log.Printf("ℹ️ 当前无标记为运行中的交易员，可通过Web端手动启动")
 	}
 
 	// 创建初始化上下文

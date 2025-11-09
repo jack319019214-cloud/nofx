@@ -1,0 +1,5 @@
+id              name      provider  enabled  user_id                             
+--------------  --------  --------  -------  ------------------------------------
+deepseek        DeepSeek  deepseek  0        default                             
+qwen            Qwen      qwen      0        default                             
+admin_deepseek  DeepSeek  deepseek  1        dddf23c8-a3ca-45ed-bf85-2075663ea7a8

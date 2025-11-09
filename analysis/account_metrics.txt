@@ -1,0 +1,9 @@
+balances_sampled: 954
+balance_min: 0.00
+balance_max: 29.14
+balance_last: 27.90
+margin_avg: 28.96
+margin_max: 97.18
+position_count_0: 571
+position_count_1: 374
+position_count_2: 9
