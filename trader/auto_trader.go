@@ -334,9 +334,9 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 
 	changePercent := ((actualBalance - oldBalance) / oldBalance) * 100
 
-	// 变化超过5%才更新
-	if math.Abs(changePercent) > 5.0 {
-		log.Printf("🔔 [%s] 检测到余额大幅变化: %.2f → %.2f USDT (%.2f%%)",
+	// 只有检测到明显“新增资金”时才同步初始余额，避免因为亏损或持仓占用被误判
+	if changePercent > 5.0 {
+		log.Printf("🔔 [%s] 检测到余额显著增加: %.2f → %.2f USDT (+%.2f%%)，同步初始资金",
 			at.name, oldBalance, actualBalance, changePercent)
 
 		// 更新内存中的 initialBalance
@@ -344,9 +344,6 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 
 		// 更新数据库（需要类型断言）
 		if at.database != nil {
-			// 这里需要根据实际的数据库类型进行类型断言
-			// 由于使用了 interface{}，我们需要在 TraderManager 层面处理更新
-			// 或者在这里进行类型检查
 			type DatabaseUpdater interface {
 				UpdateTraderInitialBalance(userID, id string, newBalance float64) error
 			}
@@ -364,7 +361,11 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 			log.Printf("⚠️ [%s] 数据库引用为空，余额仅在内存中更新", at.name)
 		}
 	} else {
-		log.Printf("✓ [%s] 余额变化不大 (%.2f%%)，无需更新", at.name, changePercent)
+		if changePercent < -5.0 {
+			log.Printf("ℹ️ [%s] 实际余额下降 %.2f%%，视为交易回撤，不调整初始资金", at.name, changePercent)
+		} else {
+			log.Printf("✓ [%s] 余额变化不大 (%.2f%%)，无需更新", at.name, changePercent)
+		}
 	}
 
 	at.lastBalanceSyncTime = time.Now()
