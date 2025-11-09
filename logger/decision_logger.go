@@ -119,6 +119,11 @@ func (l *DecisionLogger) GetLatestRecords(n int) ([]*DecisionRecord, error) {
 		return nil, fmt.Errorf("读取日志目录失败: %w", err)
 	}
 
+	totalFiles := len(files)
+	if n <= 0 || n > totalFiles {
+		n = totalFiles
+	}
+
 	// 先按修改时间倒序收集（最新的在前）
 	var records []*DecisionRecord
 	count := 0
