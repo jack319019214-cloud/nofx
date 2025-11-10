@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
@@ -311,10 +312,20 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 
 	// 2. 硬约束（风险控制）- 动态生成
 	sb.WriteString("# 硬约束（风险控制）\n\n")
-	sb.WriteString("1. 风险回报比: 必须 ≥ 1:3（冒1%风险，赚3%+收益）\n")
+	sb.WriteString("1. 风险回报比: 必须 ≥ 1:2；若遇到极强动量或关键位破位，允许在思维链中说明理由后放宽至 ≥1:1.8\n")
 	sb.WriteString("2. 最多持仓: 3个币种（质量>数量）\n")
+
+	altMin, altMax := calcPositionRange(accountEquity, 0.4, 0.8, 12, 0.8)
+
+	var btcMin, btcMax float64
+	if accountEquity <= 200 {
+		btcMin, btcMax = 120, 180
+	} else {
+		btcMin, btcMax = calcPositionRange(accountEquity, 0.6, 1.2, 105, 2.0)
+	}
+
 	sb.WriteString(fmt.Sprintf("3. 单币仓位: 山寨%.0f-%.0f U | BTC/ETH %.0f-%.0f U\n",
-		accountEquity*0.8, accountEquity*1.5, accountEquity*5, accountEquity*10))
+		altMin, altMax, btcMin, btcMax))
 	sb.WriteString(fmt.Sprintf("4. 杠杆限制: **山寨币最大%dx杠杆** | **BTC/ETH最大%dx杠杆** (⚠️ 严格执行，不可超过)\n", altcoinLeverage, btcEthLeverage))
 	sb.WriteString("5. 保证金: 总使用率 ≤ 90%\n")
 	sb.WriteString("6. 开仓金额: 建议 **≥12 USDT** (交易所最小名义价值 10 USDT + 安全边际)\n\n")
@@ -339,6 +350,25 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 开仓时必填: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd, reasoning\n\n")
 
 	return sb.String()
+}
+
+// calcPositionRange 根据账户规模给出合适的仓位区间，避免小账户出现不可执行的指引
+func calcPositionRange(accountEquity, minFactor, maxFactor, absoluteMin, maxCapMultiplier float64) (float64, float64) {
+	if accountEquity <= 0 {
+		return absoluteMin, absoluteMin * 1.2
+	}
+
+	minVal := math.Max(absoluteMin, accountEquity*minFactor)
+	maxVal := math.Max(minVal, accountEquity*maxFactor)
+
+	if maxCapMultiplier > 0 {
+		maxCap := accountEquity * maxCapMultiplier
+		if maxVal > maxCap {
+			maxVal = maxCap
+		}
+	}
+
+	return minVal, maxVal
 }
 
 // buildUserPrompt 构建 User Prompt（动态数据）
@@ -726,7 +756,8 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		// ✅ 验证最小开仓金额（防止数量格式化为 0 的错误）
 		// Binance 最小名义价值 10 USDT + 安全边际
 		const minPositionSizeGeneral = 12.0 // 10 + 20% 安全边际
-		const minPositionSizeBTCETH = 60.0  // BTC/ETH 因价格高和精度限制需要更大金额（更灵活）
+		// BTC/ETH 期货 LOT_SIZE=0.001，乘当前10w左右价格 ≈ 100 USDT，不足会被格式化成0
+		const minPositionSizeBTCETH = 105.0
 
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 			if d.PositionSizeUSD < minPositionSizeBTCETH {

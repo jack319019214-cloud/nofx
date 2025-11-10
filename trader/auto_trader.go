@@ -739,12 +739,13 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
 
-	// ⚠️ 关键：检查是否已有同币种同方向持仓，如果有则拒绝开仓（防止仓位叠加超限）
+	// ⚠️ 如果已有同方向持仓，则视为加仓，但仍需记录日志（由保证金检查确保安全）
 	positions, err := at.trader.GetPositions()
 	if err == nil {
 		for _, pos := range positions {
 			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
-				return fmt.Errorf("❌ %s 已有多仓，拒绝开仓以防止仓位叠加超限。如需换仓，请先给出 close_long 决策", decision.Symbol)
+				log.Printf("  ➕ %s 已有多仓，视为加仓操作 (原数量 %.5f)", decision.Symbol, pos["positionAmt"])
+				break
 			}
 		}
 	}
@@ -824,7 +825,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if err == nil {
 		for _, pos := range positions {
 			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
-				return fmt.Errorf("❌ %s 已有空仓，拒绝开仓以防止仓位叠加超限。如需换仓，请先给出 close_short 决策", decision.Symbol)
+				log.Printf("  ➕ %s 已有空仓，视为加仓操作 (原数量 %.5f)", decision.Symbol, pos["positionAmt"])
+				break
 			}
 		}
 	}
