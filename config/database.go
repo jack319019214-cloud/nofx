@@ -504,22 +504,37 @@ func (d *Database) CreateUser(user *User) error {
 func (d *Database) EnsureAdminUser() error {
 	// 检查admin用户是否已存在
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'admin'`).Scan(&count)
+	var passwordHash string
+	err := d.db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(password_hash), '') FROM users WHERE id = 'admin'`).Scan(&count, &passwordHash)
 	if err != nil {
 		return err
 	}
 
-	// 如果已存在，直接返回
-	if count > 0 {
+	// 如果已存在且有密码，直接返回
+	if count > 0 && len(passwordHash) >= 60 {
 		return nil
 	}
 
-	// 创建admin用户（密码为空，因为管理员模式下不需要密码）
+	// 如果已存在但密码为空或异常，修复密码和邮箱
+	if count > 0 {
+		log.Printf("⚠️  检测到 admin 用户密码异常 (长度: %d)，使用默认密码", len(passwordHash))
+		// 默认密码 "admin123" 的 bcrypt hash
+		defaultHash := "$2a$10$Vll7AlSknhdUxLsFDlzkVOpCb/IDNkVoeRJtNeYVED8TbWgQiUX/i"
+		_, err = d.db.Exec(`UPDATE users SET email = ?, password_hash = ? WHERE id = 'admin'`, "admin@admin.com", defaultHash)
+		if err != nil {
+			return fmt.Errorf("修复 admin 密码失败: %w", err)
+		}
+		log.Printf("✅ admin 用户已修复 (邮箱: admin@admin.com, 密码: admin123)")
+		return nil
+	}
+
+	// 创建admin用户（使用默认密码）
+	log.Printf("📝 创建 admin 用户 (邮箱: admin@admin.com, 密码: admin123)")
 	adminUser := &User{
 		ID:           "admin",
-		Email:        "admin@localhost",
-		PasswordHash: "", // 管理员模式下不使用密码
-		OTPSecret:    nil, // 管理员模式下不需要OTP
+		Email:        "admin@admin.com",
+		PasswordHash: "$2a$10$Vll7AlSknhdUxLsFDlzkVOpCb/IDNkVoeRJtNeYVED8TbWgQiUX/i", // 默认密码: admin123
+		OTPSecret:    nil,
 		OTPVerified:  true,
 	}
 

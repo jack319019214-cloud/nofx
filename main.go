@@ -198,6 +198,11 @@ func main() {
 		log.Printf("⚠️  加载内测码到数据库失败: %v", err)
 	}
 
+	// 确保 admin 用户存在且密码正常
+	if err := database.EnsureAdminUser(); err != nil {
+		log.Printf("⚠️  确保 admin 用户失败: %v", err)
+	}
+
 	// 获取系统配置
 	useDefaultCoinsStr, _ := database.GetSystemConfig("use_default_coins")
 	useDefaultCoins := useDefaultCoinsStr == "true"
