@@ -687,8 +687,8 @@ func compactArrayOpen(s string) string {
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
 func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
-	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	for i := range decisions {
+		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -739,8 +739,8 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	// 开仓操作必须提供完整参数
 	if d.Action == "open_long" || d.Action == "open_short" {
 		// 根据币种使用配置的杠杆上限
-		maxLeverage := altcoinLeverage          // 山寨币使用配置的杠杆
-		maxPositionValue := accountEquity * 1.5 // 山寨币最多1.5倍账户净值
+		maxLeverage := altcoinLeverage           // 山寨币使用配置的杠杆
+		maxPositionValue := accountEquity * 10.0 // 山寨币最多10倍账户净值
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 			maxLeverage = btcEthLeverage          // BTC和ETH使用配置的杠杆
 			maxPositionValue = accountEquity * 10 // BTC/ETH最多10倍账户净值
@@ -775,7 +775,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 				return fmt.Errorf("BTC/ETH单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
 			} else {
-				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（1.5倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
+				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
 			}
 		}
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
@@ -828,6 +828,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 	// 动态调整止损验证
 	if d.Action == "update_stop_loss" {
+		if d.NewStopLoss <= 0 && d.StopLoss > 0 {
+			d.NewStopLoss = d.StopLoss // 兼容旧字段命名
+		}
 		if d.NewStopLoss <= 0 {
 			return fmt.Errorf("新止损价格必须大于0: %.2f", d.NewStopLoss)
 		}
@@ -835,6 +838,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 	// 动态调整止盈验证
 	if d.Action == "update_take_profit" {
+		if d.NewTakeProfit <= 0 && d.TakeProfit > 0 {
+			d.NewTakeProfit = d.TakeProfit // 兼容旧字段命名
+		}
 		if d.NewTakeProfit <= 0 {
 			return fmt.Errorf("新止盈价格必须大于0: %.2f", d.NewTakeProfit)
 		}
