@@ -35,7 +35,7 @@ type FuturesTrader struct {
 }
 
 const (
-	binanceAPIMaxRetries  = 5              // 增加到5次重试
+	binanceAPIMaxRetries  = 5               // 增加到5次重试
 	binanceRetryBaseDelay = 2 * time.Second // 增加基础延迟到2秒
 	cacheStaleGracePeriod = 5 * time.Minute
 	proxyRecoveryWaitTime = 10 * time.Second // 代理恢复等待时间
@@ -891,8 +891,7 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 
 // GetMinNotional 获取最小名义价值（Binance要求）
 func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
-	// 使用保守的默认值 10 USDT，确保订单能够通过交易所验证
-	return 10.0
+	return util.GetMinNotionalUSD(symbol)
 }
 
 // CheckMinNotional 检查订单是否满足最小名义价值要求

@@ -292,16 +292,30 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 		return
 	}
 
-	// 提取可用余额
-	var actualBalance float64
-	if availableBalance, ok := balanceInfo["available_balance"].(float64); ok && availableBalance > 0 {
+	// 提取账户总权益（钱包余额 + 未实现盈亏），更准确反映补仓/提币
+	var (
+		actualBalance float64
+		walletBalance float64
+		unrealizedPnL float64
+	)
+	if wallet, ok := balanceInfo["totalWalletBalance"].(float64); ok {
+		walletBalance = wallet
+	}
+	if unrealized, ok := balanceInfo["totalUnrealizedProfit"].(float64); ok {
+		unrealizedPnL = unrealized
+	}
+	if walletBalance > 0 || unrealizedPnL != 0 {
+		actualBalance = walletBalance + unrealizedPnL
+	} else if totalEquity, ok := balanceInfo["total_equity"].(float64); ok && totalEquity > 0 {
+		actualBalance = totalEquity
+	} else if availableBalance, ok := balanceInfo["available_balance"].(float64); ok && availableBalance > 0 {
 		actualBalance = availableBalance
 	} else if availableBalance, ok := balanceInfo["availableBalance"].(float64); ok && availableBalance > 0 {
 		actualBalance = availableBalance
 	} else if totalBalance, ok := balanceInfo["balance"].(float64); ok && totalBalance > 0 {
 		actualBalance = totalBalance
 	} else {
-		log.Printf("⚠️ [%s] 无法提取可用余额", at.name)
+		log.Printf("⚠️ [%s] 无法提取账户权益信息", at.name)
 		at.lastBalanceSyncTime = time.Now()
 		return
 	}
@@ -596,6 +610,19 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 
 	for _, pos := range positions {
 		symbol := pos["symbol"].(string)
+		if len(at.tradingCoins) > 0 {
+			normalized := normalizeSymbol(symbol)
+			allowed := false
+			for _, coin := range at.tradingCoins {
+				if normalizeSymbol(coin) == normalized {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				continue // 忽略与交易员无关的持仓
+			}
+		}
 		side := pos["side"].(string)
 		entryPrice := pos["entryPrice"].(float64)
 		markPrice := pos["markPrice"].(float64)
@@ -712,6 +739,21 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 
 // executeDecisionWithRecord 执行AI决策并记录详细信息
 func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
+	// Ensure symbol is allowed for this trader
+	if len(at.tradingCoins) > 0 {
+		normalized := normalizeSymbol(decision.Symbol)
+		allowed := false
+		for _, coin := range at.tradingCoins {
+			if normalizeSymbol(coin) == normalized {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("[%s] 决策币种 %s 不在允许列表 %v", at.name, decision.Symbol, at.tradingCoins)
+		}
+	}
+
 	switch decision.Action {
 	case "open_long":
 		return at.executeOpenLongWithRecord(decision, actionRecord)

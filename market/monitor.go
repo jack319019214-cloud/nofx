@@ -125,9 +125,19 @@ func (m *WSMonitor) Start(coins []string) {
 		return
 	}
 
-	err = m.combinedClient.Connect()
-	if err != nil {
-		log.Printf("❌ 批量订阅流失败: %v", err)
+	const maxConnectRetries = 5
+	var connectErr error
+	for attempt := 1; attempt <= maxConnectRetries; attempt++ {
+		connectErr = m.combinedClient.Connect()
+		if connectErr == nil {
+			break
+		}
+		wait := time.Duration(attempt) * time.Second
+		log.Printf("⚠️ 批量订阅流连接失败: %v，%d秒后重试 (%d/%d)", connectErr, int(wait/time.Second), attempt, maxConnectRetries)
+		time.Sleep(wait)
+	}
+	if connectErr != nil {
+		log.Printf("❌ 批量订阅流失败: %v", connectErr)
 		return
 	}
 	// 订阅所有交易对

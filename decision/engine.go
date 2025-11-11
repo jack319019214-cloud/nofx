@@ -8,6 +8,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"nofx/util"
 	"regexp"
 	"strings"
 	"time"
@@ -753,20 +754,14 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			return fmt.Errorf("仓位大小必须大于0: %.2f", d.PositionSizeUSD)
 		}
 
-		// ✅ 验证最小开仓金额（防止数量格式化为 0 的错误）
-		// Binance 最小名义价值 10 USDT + 安全边际
-		const minPositionSizeGeneral = 12.0 // 10 + 20% 安全边际
-		// BTC/ETH 期货 LOT_SIZE=0.001，乘当前10w左右价格 ≈ 100 USDT，不足会被格式化成0
-		const minPositionSizeBTCETH = 105.0
-
-		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-			if d.PositionSizeUSD < minPositionSizeBTCETH {
-				return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（因价格高且精度限制，避免数量四舍五入为0）", d.Symbol, d.PositionSizeUSD, minPositionSizeBTCETH)
+		// ✅ 验证最小开仓金额（根据交易所规则动态调整）
+		minPositionSize := util.GetSafeMinPositionUSD(d.Symbol)
+		symbolUpper := strings.ToUpper(d.Symbol)
+		if d.PositionSizeUSD < minPositionSize {
+			if symbolUpper == "BTCUSDT" || symbolUpper == "ETHUSDT" {
+				return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（因价格高且精度限制，避免数量四舍五入为0）", symbolUpper, d.PositionSizeUSD, minPositionSize)
 			}
-		} else {
-			if d.PositionSizeUSD < minPositionSizeGeneral {
-				return fmt.Errorf("开仓金额过小(%.2f USDT)，必须≥%.2f USDT（Binance 最小名义价值要求）", d.PositionSizeUSD, minPositionSizeGeneral)
-			}
+			return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（Binance 最小名义价值要求）", symbolUpper, d.PositionSizeUSD, minPositionSize)
 		}
 
 		// 验证仓位价值上限（加1%容差以避免浮点数精度问题）
