@@ -826,6 +826,9 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		posSide = futures.PositionSideTypeShort
 	}
 
+	// 防止止损价格与最新价过近导致 "Order would immediately trigger"
+	stopPrice = t.ensureStopPriceBuffer(symbol, positionSide, stopPrice)
+
 	// 格式化数量
 	quantityStr, err := t.FormatQuantity(symbol, quantity)
 	if err != nil {
@@ -849,6 +852,34 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 
 	log.Printf("  止损价设置: %.4f", stopPrice)
 	return nil
+}
+
+func (t *FuturesTrader) ensureStopPriceBuffer(symbol, positionSide string, stopPrice float64) float64 {
+	const bufferRatio = 0.0015 // 0.15%
+	price, err := t.GetMarketPrice(symbol)
+	if err != nil || price <= 0 {
+		if err != nil {
+			log.Printf("  ⚠ 无法获取 %s 市价以校验止损距离: %v", symbol, err)
+		}
+		return stopPrice
+	}
+
+	sanitized := stopPrice
+	if strings.ToUpper(positionSide) == "LONG" {
+		maxStop := price * (1 - bufferRatio)
+		if sanitized >= maxStop {
+			log.Printf("  ⚠ %s 多单止损 %.4f 距价格 %.4f 过近，调整为 %.4f 以避免立即触发", symbol, stopPrice, price, maxStop)
+			sanitized = maxStop
+		}
+	} else {
+		minStop := price * (1 + bufferRatio)
+		if sanitized <= minStop {
+			log.Printf("  ⚠ %s 空单止损 %.4f 距价格 %.4f 过近，调整为 %.4f 以避免立即触发", symbol, stopPrice, price, minStop)
+			sanitized = minStop
+		}
+	}
+
+	return sanitized
 }
 
 // SetTakeProfit 设置止盈单

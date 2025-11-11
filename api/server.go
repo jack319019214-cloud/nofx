@@ -129,6 +129,7 @@ func (s *Server) setupRoutes() {
 			protected.POST("/traders/:id/start", s.handleStartTrader)
 			protected.POST("/traders/:id/stop", s.handleStopTrader)
 			protected.PUT("/traders/:id/prompt", s.handleUpdateTraderPrompt)
+			protected.PUT("/traders/:id/baseline", s.handleUpdateBaseline)
 			protected.POST("/traders/:id/sync-balance", s.handleSyncBalance)
 
 			// AI模型配置
@@ -392,8 +393,8 @@ type SafeModelConfig struct {
 	Name            string `json:"name"`
 	Provider        string `json:"provider"`
 	Enabled         bool   `json:"enabled"`
-	CustomAPIURL    string `json:"customApiUrl"`        // 自定义API URL（通常不敏感）
-	CustomModelName string `json:"customModelName"`     // 自定义模型名（不敏感）
+	CustomAPIURL    string `json:"customApiUrl"`    // 自定义API URL（通常不敏感）
+	CustomModelName string `json:"customModelName"` // 自定义模型名（不敏感）
 }
 
 type ExchangeConfig struct {
@@ -877,6 +878,41 @@ func (s *Server) handleUpdateTraderPrompt(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "自定义prompt已更新"})
+}
+
+// handleUpdateBaseline 手动设置交易员的初始资金基准
+func (s *Server) handleUpdateBaseline(c *gin.Context) {
+	traderID := c.Param("id")
+	userID := c.GetString("user_id")
+
+	var req struct {
+		Baseline float64 `json:"baseline"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: baseline"})
+		return
+	}
+
+	if req.Baseline <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "baseline 必须大于0"})
+		return
+	}
+
+	// 更新数据库中的 initial_balance
+	if err := s.database.UpdateTraderInitialBalance(userID, traderID, req.Baseline); err != nil {
+		log.Printf("❌ 手动更新初始资金失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新基准失败"})
+		return
+	}
+
+	// 尝试更新内存中的 trader，避免等待重载
+	if at, err := s.traderManager.GetTrader(traderID); err == nil {
+		at.SetInitialBalance(req.Baseline)
+	}
+
+	log.Printf("📏 用户 %s 将交易员 %s 的初始资金设置为 %.2f", userID, traderID, req.Baseline)
+	c.JSON(http.StatusOK, gin.H{"message": "初始资金基准已更新", "baseline": req.Baseline})
 }
 
 // handleSyncBalance 同步交易所余额到initial_balance（选项B：手动同步 + 选项C：智能检测）
@@ -1562,7 +1598,6 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 		c.Next()
 	}
 }
-
 
 // handleLogout 将当前token加入黑名单
 func (s *Server) handleLogout(c *gin.Context) {

@@ -10,6 +10,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"nofx/util"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +106,7 @@ type AutoTrader struct {
 	peakPnLCache          map[string]float64 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
 	peakPnLCacheMutex     sync.RWMutex       // 缓存读写锁
 	lastBalanceSyncTime   time.Time          // 上次余额同步时间
+	lastEquitySnapshot    float64            // 上次检测到的账户净值（用于识别充值/提现）
 	database              interface{}        // 数据库引用（用于自动更新余额）
 	userID                string             // 用户ID
 }
@@ -231,6 +233,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		peakPnLCache:          make(map[string]float64),
 		peakPnLCacheMutex:     sync.RWMutex{},
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
+		lastEquitySnapshot:    config.InitialBalance,
 		database:              database,
 		userID:                userID,
 	}, nil
@@ -273,6 +276,21 @@ func (at *AutoTrader) Stop() {
 	close(at.stopMonitorCh) // 通知监控goroutine停止
 	at.monitorWg.Wait()     // 等待监控goroutine结束
 	log.Println("⏹ 自动交易系统停止")
+}
+
+// SetInitialBalance 手动设置新的初始资金基准
+func (at *AutoTrader) SetInitialBalance(newBalance float64) {
+	if newBalance <= 0 {
+		log.Printf("⚠️ [%s] 忽略无效的初始资金值: %.2f", at.name, newBalance)
+		return
+	}
+
+	oldBalance := at.initialBalance
+	at.initialBalance = newBalance
+	at.lastEquitySnapshot = newBalance
+	at.lastBalanceSyncTime = time.Now()
+
+	log.Printf("📏 [%s] 初始资金基准已调整: %.2f → %.2f", at.name, oldBalance, newBalance)
 }
 
 // autoSyncBalanceIfNeeded 自动同步余额（每10分钟检查一次，变化>5%才更新）
@@ -320,68 +338,49 @@ func (at *AutoTrader) autoSyncBalanceIfNeeded() {
 		return
 	}
 
-	oldBalance := at.initialBalance
-
-	// 防止除以零：如果初始余额无效，直接更新为实际余额
-	if oldBalance <= 0 {
-		log.Printf("⚠️ [%s] 初始余额无效 (%.2f)，直接更新为实际余额 %.2f USDT", at.name, oldBalance, actualBalance)
-		at.initialBalance = actualBalance
-		if at.database != nil {
-			type DatabaseUpdater interface {
-				UpdateTraderInitialBalance(userID, id string, newBalance float64) error
-			}
-			if db, ok := at.database.(DatabaseUpdater); ok {
-				if err := db.UpdateTraderInitialBalance(at.userID, at.id, actualBalance); err != nil {
-					log.Printf("❌ [%s] 更新数据库失败: %v", at.name, err)
-				} else {
-					log.Printf("✅ [%s] 已自动同步余额到数据库", at.name)
-				}
-			} else {
-				log.Printf("⚠️ [%s] 数据库类型不支持UpdateTraderInitialBalance接口", at.name)
-			}
-		} else {
-			log.Printf("⚠️ [%s] 数据库引用为空，余额仅在内存中更新", at.name)
-		}
+	if at.lastEquitySnapshot == 0 {
+		at.lastEquitySnapshot = actualBalance
 		at.lastBalanceSyncTime = time.Now()
 		return
 	}
 
-	changePercent := ((actualBalance - oldBalance) / oldBalance) * 100
+	equityDelta := actualBalance - at.lastEquitySnapshot
+	threshold := math.Max(5, at.lastEquitySnapshot*0.15)
 
-	// 只有检测到明显“新增资金”时才同步初始余额，避免因为亏损或持仓占用被误判
-	if changePercent > 5.0 {
-		log.Printf("🔔 [%s] 检测到余额显著增加: %.2f → %.2f USDT (+%.2f%%)，同步初始资金",
-			at.name, oldBalance, actualBalance, changePercent)
+	if math.Abs(equityDelta) >= threshold {
+		changeType := "充值"
+		if equityDelta < 0 {
+			changeType = "提现/划出"
+		}
+		log.Printf("🔔 [%s] 检测到外部资金变动 (%s): Δ%.2f USDT (%.2f → %.2f)",
+			at.name, changeType, equityDelta, at.lastEquitySnapshot, actualBalance)
 
-		// 更新内存中的 initialBalance
-		at.initialBalance = actualBalance
+		at.initialBalance += equityDelta
+		if at.initialBalance < 0 {
+			at.initialBalance = actualBalance
+		}
 
-		// 更新数据库（需要类型断言）
 		if at.database != nil {
 			type DatabaseUpdater interface {
 				UpdateTraderInitialBalance(userID, id string, newBalance float64) error
 			}
 			if db, ok := at.database.(DatabaseUpdater); ok {
-				err := db.UpdateTraderInitialBalance(at.userID, at.id, actualBalance)
-				if err != nil {
+				if err := db.UpdateTraderInitialBalance(at.userID, at.id, at.initialBalance); err != nil {
 					log.Printf("❌ [%s] 更新数据库失败: %v", at.name, err)
 				} else {
-					log.Printf("✅ [%s] 已自动同步余额到数据库", at.name)
+					log.Printf("✅ [%s] 初始资金已更新为 %.2f USDT", at.name, at.initialBalance)
 				}
 			} else {
 				log.Printf("⚠️ [%s] 数据库类型不支持UpdateTraderInitialBalance接口", at.name)
 			}
 		} else {
-			log.Printf("⚠️ [%s] 数据库引用为空，余额仅在内存中更新", at.name)
+			log.Printf("⚠️ [%s] 数据库引用为空，初始资金仅在内存中更新", at.name)
 		}
 	} else {
-		if changePercent < -5.0 {
-			log.Printf("ℹ️ [%s] 实际余额下降 %.2f%%，视为交易回撤，不调整初始资金", at.name, changePercent)
-		} else {
-			log.Printf("✓ [%s] 余额变化不大 (%.2f%%)，无需更新", at.name, changePercent)
-		}
+		log.Printf("✓ [%s] Equity变化 %.2f USDT (<阈值 %.2f)，判定为正常盈亏", at.name, equityDelta, threshold)
 	}
 
+	at.lastEquitySnapshot = actualBalance
 	at.lastBalanceSyncTime = time.Now()
 }
 
@@ -739,8 +738,8 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 
 // executeDecisionWithRecord 执行AI决策并记录详细信息
 func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
-	// Ensure symbol is allowed for this trader
-	if len(at.tradingCoins) > 0 {
+	// Ensure symbol is allowed for this trader（wait/hold 或 ALL 通配符放行）
+	if len(at.tradingCoins) > 0 && !strings.EqualFold(decision.Symbol, "ALL") && decision.Symbol != "" {
 		normalized := normalizeSymbol(decision.Symbol)
 		allowed := false
 		for _, coin := range at.tradingCoins {
@@ -798,11 +797,6 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return err
 	}
 
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
-
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
 	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 
@@ -814,15 +808,31 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if avail, ok := balance["availableBalance"].(float64); ok {
 		availableBalance = avail
 	}
+	feeRate := 0.0004
+	unitCost := (1.0 / float64(decision.Leverage)) + feeRate
 
 	// 手续费估算（Taker费率 0.04%）
-	estimatedFee := decision.PositionSizeUSD * 0.0004
+	estimatedFee := decision.PositionSizeUSD * feeRate
 	totalRequired := requiredMargin + estimatedFee
 
 	if totalRequired > availableBalance {
-		return fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
-			totalRequired, requiredMargin, estimatedFee, availableBalance)
+		adjustedUSD := (availableBalance * 0.99) / unitCost
+		minUSD := util.GetSafeMinPositionUSD(decision.Symbol)
+		if adjustedUSD < minUSD {
+			return fmt.Errorf("❌ 保证金不足: 计划 %.2f USDT，需要 %.2f USDT，可用 %.2f USDT；最大可用仓位 %.2f USDT 低于最小要求 %.2f USDT",
+				decision.PositionSizeUSD, totalRequired, availableBalance, adjustedUSD, minUSD)
+		}
+		log.Printf("  ⚠️ 保证金不足，自动将仓位从 %.2f USDT 调整为 %.2f USDT (杠杆 %dx)",
+			decision.PositionSizeUSD, adjustedUSD, decision.Leverage)
+		decision.PositionSizeUSD = adjustedUSD
+		requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
+		estimatedFee = decision.PositionSizeUSD * feeRate
+		totalRequired = requiredMargin + estimatedFee
 	}
+
+	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	// 设置仓位模式
 	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
@@ -879,10 +889,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return err
 	}
 
-	// 计算数量
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
-	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
+	feeRate := 0.0004
 
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
 	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
@@ -895,15 +902,30 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if avail, ok := balance["availableBalance"].(float64); ok {
 		availableBalance = avail
 	}
+	unitCost := (1.0 / float64(decision.Leverage)) + feeRate
 
 	// 手续费估算（Taker费率 0.04%）
-	estimatedFee := decision.PositionSizeUSD * 0.0004
+	estimatedFee := decision.PositionSizeUSD * feeRate
 	totalRequired := requiredMargin + estimatedFee
 
 	if totalRequired > availableBalance {
-		return fmt.Errorf("❌ 保证金不足: 需要 %.2f USDT（保证金 %.2f + 手续费 %.2f），可用 %.2f USDT",
-			totalRequired, requiredMargin, estimatedFee, availableBalance)
+		adjustedUSD := (availableBalance * 0.99) / unitCost
+		minUSD := util.GetSafeMinPositionUSD(decision.Symbol)
+		if adjustedUSD < minUSD {
+			return fmt.Errorf("❌ 保证金不足: 计划 %.2f USDT，需要 %.2f USDT，可用 %.2f USDT；最大可用仓位 %.2f USDT 低于最小要求 %.2f USDT",
+				decision.PositionSizeUSD, totalRequired, availableBalance, adjustedUSD, minUSD)
+		}
+		log.Printf("  ⚠️ 保证金不足，自动将仓位从 %.2f USDT 调整为 %.2f USDT (杠杆 %dx)",
+			decision.PositionSizeUSD, adjustedUSD, decision.Leverage)
+		decision.PositionSizeUSD = adjustedUSD
+		requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
+		estimatedFee = decision.PositionSizeUSD * feeRate
+		totalRequired = requiredMargin + estimatedFee
 	}
+
+	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	actionRecord.Quantity = quantity
+	actionRecord.Price = marketData.CurrentPrice
 
 	// 设置仓位模式
 	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
