@@ -2,8 +2,10 @@ package trader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +34,24 @@ type FuturesTrader struct {
 	cacheDuration time.Duration
 }
 
+const (
+	binanceAPIMaxRetries  = 5              // 增加到5次重试
+	binanceRetryBaseDelay = 2 * time.Second // 增加基础延迟到2秒
+	cacheStaleGracePeriod = 5 * time.Minute
+	proxyRecoveryWaitTime = 10 * time.Second // 代理恢复等待时间
+)
+
+var transientBinanceErrors = []string{
+	"EOF",
+	"unexpected EOF",
+	"connection reset by peer",
+	"broken pipe",
+	"tls",
+	"Client.Timeout",
+	"context deadline exceeded",
+	"i/o timeout",
+}
+
 // NewFuturesTrader 创建合约交易器
 func NewFuturesTrader(apiKey, secretKey string) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
@@ -54,6 +74,81 @@ func NewFuturesTrader(apiKey, secretKey string) *FuturesTrader {
 	}
 
 	return trader
+}
+
+func isTransientBinanceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if netErr, ok := err.(net.Error); ok {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+	}
+	errMsg := err.Error()
+	for _, hint := range transientBinanceErrors {
+		if strings.Contains(errMsg, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryBinanceCall(operation string, fn func() error) error {
+	var lastErr error
+	delay := binanceRetryBaseDelay
+	consecutiveEOFCount := 0
+
+	for attempt := 1; attempt <= binanceAPIMaxRetries; attempt++ {
+		lastErr = fn()
+		if lastErr == nil {
+			if attempt > 1 {
+				log.Printf("✓ %s在第%d次重试后成功", operation, attempt)
+			}
+			return nil
+		}
+
+		// 检测是否为EOF错误(代理问题)
+		isEOF := strings.Contains(lastErr.Error(), "EOF")
+		if isEOF {
+			consecutiveEOFCount++
+		}
+
+		// 非临时性错误或最后一次尝试,直接返回
+		if !isTransientBinanceError(lastErr) || attempt == binanceAPIMaxRetries {
+			if consecutiveEOFCount >= 3 {
+				log.Printf("❌ 检测到连续%d次EOF错误,可能代理异常,建议检查ss-proxy容器", consecutiveEOFCount)
+			}
+			break
+		}
+
+		// 如果是EOF错误且连续多次,给代理更多恢复时间
+		if isEOF && consecutiveEOFCount >= 2 && attempt < binanceAPIMaxRetries {
+			log.Printf("⚠️ %s失败: %v，检测到代理问题,等待%d秒让代理恢复... (%d/%d)",
+				operation, lastErr, int(proxyRecoveryWaitTime/time.Second), attempt, binanceAPIMaxRetries)
+			time.Sleep(proxyRecoveryWaitTime)
+		} else {
+			log.Printf("⚠️ %s失败: %v，%d秒后重试 (%d/%d)",
+				operation, lastErr, int(delay/time.Second), attempt, binanceAPIMaxRetries)
+			time.Sleep(delay)
+		}
+
+		delay *= 2 // 指数退避
+		if delay > 30*time.Second {
+			delay = 30 * time.Second // 最大延迟30秒
+		}
+	}
+	return lastErr
+}
+
+func isCacheFreshEnough(cacheTime time.Time) bool {
+	if cacheTime.IsZero() {
+		return false
+	}
+	return time.Since(cacheTime) <= cacheStaleGracePeriod
 }
 
 // setDualSidePosition 设置双向持仓模式（初始化时调用）
@@ -106,8 +201,24 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 
 	// 缓存过期或不存在，调用API
 	log.Printf("🔄 缓存过期，正在调用币安API获取账户余额...")
-	account, err := t.client.NewGetAccountService().Do(context.Background())
+	var account *futures.Account
+	err := retryBinanceCall("获取账户余额", func() error {
+		var innerErr error
+		account, innerErr = t.client.NewGetAccountService().Do(context.Background())
+		return innerErr
+	})
 	if err != nil {
+		if isTransientBinanceError(err) {
+			t.balanceCacheMutex.RLock()
+			cached := t.cachedBalance
+			cacheTime := t.balanceCacheTime
+			t.balanceCacheMutex.RUnlock()
+			if cached != nil && isCacheFreshEnough(cacheTime) {
+				age := time.Since(cacheTime).Seconds()
+				log.Printf("⚠️ 无法实时获取账户余额(%v)，使用%.1f秒前的缓存数据", err, age)
+				return cached, nil
+			}
+		}
 		log.Printf("❌ 币安API调用失败: %v", err)
 		return nil, fmt.Errorf("获取账户信息失败: %w", err)
 	}
@@ -145,8 +256,24 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 
 	// 缓存过期或不存在，调用API
 	log.Printf("🔄 缓存过期，正在调用币安API获取持仓信息...")
-	positions, err := t.client.NewGetPositionRiskService().Do(context.Background())
+	var positions []*futures.PositionRisk
+	err := retryBinanceCall("获取持仓信息", func() error {
+		var innerErr error
+		positions, innerErr = t.client.NewGetPositionRiskService().Do(context.Background())
+		return innerErr
+	})
 	if err != nil {
+		if isTransientBinanceError(err) {
+			t.positionsCacheMutex.RLock()
+			cached := t.cachedPositions
+			cacheTime := t.positionsCacheTime
+			t.positionsCacheMutex.RUnlock()
+			if cached != nil && isCacheFreshEnough(cacheTime) {
+				age := time.Since(cacheTime).Seconds()
+				log.Printf("⚠️ 无法实时获取持仓(%v)，使用%.1f秒前的缓存数据", err, age)
+				return cached, nil
+			}
+		}
 		return nil, fmt.Errorf("获取持仓失败: %w", err)
 	}
 
