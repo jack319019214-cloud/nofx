@@ -61,3 +61,6 @@ rsa_key*
 # 加密相关
 DATA_ENCRYPTION_KEY=*
 *.encanalysis/
+
+# 远程日志分析文件
+analysis/remote_logs/
