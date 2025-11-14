@@ -2,6 +2,7 @@ package trader
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"nofx/mcp"
 	"nofx/pool"
 	"nofx/util"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,9 +109,18 @@ type AutoTrader struct {
 	peakPnLCacheMutex     sync.RWMutex       // 缓存读写锁
 	lastBalanceSyncTime   time.Time          // 上次余额同步时间
 	lastEquitySnapshot    float64            // 上次检测到的账户净值（用于识别充值/提现）
+	lastCycleEquity       float64            // 上一次AI循环的净值，用于计算环比跌幅
 	database              interface{}        // 数据库引用（用于自动更新余额）
 	userID                string             // 用户ID
+	cycleReservedMargin   float64            // 当前决策循环内已预留的保证金
 }
+
+var errDecisionSkipped = errors.New("decision skipped by guard")
+
+const (
+	timeStopHardLimit = 45 * time.Minute
+	timeStopSoftLimit = 30 * time.Minute
+)
 
 // NewAutoTrader 创建自动交易器
 func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string) (*AutoTrader, error) {
@@ -174,17 +185,19 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 	}
 	log.Printf("📊 [%s] 仓位模式: %s", config.Name, marginModeStr)
 
-	switch config.Exchange {
-	case "binance":
+	exchangeKey := strings.ToLower(config.Exchange)
+
+	switch {
+	case exchangeKey == "binance" || exchangeKey == "cex" || strings.HasPrefix(exchangeKey, "binance_"):
 		log.Printf("🏦 [%s] 使用币安合约交易", config.Name)
 		trader = NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey)
-	case "hyperliquid":
+	case exchangeKey == "hyperliquid" || strings.HasPrefix(exchangeKey, "hyperliquid"):
 		log.Printf("🏦 [%s] 使用Hyperliquid交易", config.Name)
 		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)
 		if err != nil {
 			return nil, fmt.Errorf("初始化Hyperliquid交易器失败: %w", err)
 		}
-	case "aster":
+	case exchangeKey == "aster":
 		log.Printf("🏦 [%s] 使用Aster交易", config.Name)
 		trader, err = NewAsterTrader(config.AsterUser, config.AsterSigner, config.AsterPrivateKey)
 		if err != nil {
@@ -419,6 +432,8 @@ func (at *AutoTrader) runCycle() error {
 	at.autoSyncBalanceIfNeeded()
 
 	// 4. 收集交易上下文
+	at.cycleReservedMargin = 0
+
 	ctx, err := at.buildTradingContext()
 	if err != nil {
 		record.Success = false
@@ -458,6 +473,40 @@ func (at *AutoTrader) runCycle() error {
 	log.Printf("📊 账户净值: %.2f USDT | 可用: %.2f USDT | 持仓: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
+	equityDropPct := 0.0
+	if at.lastCycleEquity > 0 {
+		equityDropPct = (at.lastCycleEquity - ctx.Account.TotalEquity) / at.lastCycleEquity * 100
+		if equityDropPct < 0 {
+			equityDropPct = 0
+		}
+	}
+
+	if ratio, reason := at.evaluateRiskTriggers(ctx, equityDropPct, false); ratio > 0 {
+		if autoErr := at.executeAutoPartialClose(ctx, record, ratio, reason); autoErr != nil {
+			record.Success = false
+			record.ErrorMessage = fmt.Sprintf("自动减仓失败: %v", autoErr)
+			at.decisionLogger.LogDecision(record)
+			at.lastCycleEquity = ctx.Account.TotalEquity
+			return autoErr
+		}
+		at.decisionLogger.LogDecision(record)
+		at.lastCycleEquity = ctx.Account.TotalEquity
+		return nil
+	}
+
+	if acted, err := at.enforceTimeStop(ctx, record); acted {
+		if err != nil {
+			record.Success = false
+			record.ErrorMessage = fmt.Sprintf("时间止损失败: %v", err)
+		}
+		at.decisionLogger.LogDecision(record)
+		at.lastCycleEquity = ctx.Account.TotalEquity
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
 	// 5. 调用AI获取完整决策
 	log.Printf("🤖 正在请求AI分析并决策... [模板: %s]", at.systemPromptTemplate)
 	decision, err := decision.GetFullDecisionWithCustomPrompt(ctx, at.mcpClient, at.customPrompt, at.overrideBasePrompt, at.systemPromptTemplate)
@@ -477,6 +526,12 @@ func (at *AutoTrader) runCycle() error {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v", err)
 
+		if ratio, reason := at.evaluateRiskTriggers(ctx, equityDropPct, true); ratio > 0 {
+			if autoErr := at.executeAutoPartialClose(ctx, record, ratio, reason); autoErr != nil {
+				record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("自动减仓失败: %v", autoErr))
+			}
+		}
+
 		// 打印系统提示词和AI思维链（即使有错误，也要输出以便调试）
 		if decision != nil {
 			log.Print("\n" + strings.Repeat("=", 70) + "\n")
@@ -495,6 +550,7 @@ func (at *AutoTrader) runCycle() error {
 		}
 
 		at.decisionLogger.LogDecision(record)
+		at.lastCycleEquity = ctx.Account.TotalEquity
 		return fmt.Errorf("获取AI决策失败: %w", err)
 	}
 
@@ -548,13 +604,21 @@ func (at *AutoTrader) runCycle() error {
 		}
 
 		if err := at.executeDecisionWithRecord(&d, &actionRecord); err != nil {
-			log.Printf("❌ 执行决策失败 (%s %s): %v", d.Symbol, d.Action, err)
-			actionRecord.Error = err.Error()
-			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("❌ %s %s 失败: %v", d.Symbol, d.Action, err))
+			if errors.Is(err, errDecisionSkipped) {
+				if actionRecord.Error == "" {
+					actionRecord.Error = "守卫条件触发，已跳过执行"
+				}
+				log.Printf("⚠️ 决策被跳过 (%s %s): %s", d.Symbol, d.Action, actionRecord.Error)
+				record.ExecutionLog = append(record.ExecutionLog,
+					fmt.Sprintf("⚠️ %s %s 跳过: %s", d.Symbol, d.Action, actionRecord.Error))
+			} else {
+				log.Printf("❌ 执行决策失败 (%s %s): %v", d.Symbol, d.Action, err)
+				actionRecord.Error = err.Error()
+				record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("❌ %s %s 失败: %v", d.Symbol, d.Action, err))
+			}
 		} else {
 			actionRecord.Success = true
 			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("✓ %s %s 成功", d.Symbol, d.Action))
-			// 成功执行后短暂延迟
 			time.Sleep(1 * time.Second)
 		}
 
@@ -566,6 +630,7 @@ func (at *AutoTrader) runCycle() error {
 		log.Printf("⚠ 保存决策记录失败: %v", err)
 	}
 
+	at.lastCycleEquity = ctx.Account.TotalEquity
 	return nil
 }
 
@@ -797,6 +862,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return err
 	}
 
+	if block, reason := at.shouldBlockLong(decision.Symbol, marketData); block {
+		actionRecord.Error = reason
+		return errDecisionSkipped
+	}
+
+	at.adjustPositionSizeForMinNotional(decision, marketData.CurrentPrice)
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
+
 	// ⚠️ 保证金验证：防止保证金不足错误（code=-2019）
 	requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
 
@@ -804,9 +877,27 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
 	}
-	availableBalance := 0.0
-	if avail, ok := balance["availableBalance"].(float64); ok {
-		availableBalance = avail
+	availableBalance := getBalanceFloat(balance, "availableBalance")
+	totalWallet := getBalanceFloat(balance, "totalWalletBalance")
+	unrealized := getBalanceFloat(balance, "totalUnrealizedProfit")
+	totalEquity := totalWallet + unrealized
+	maxAllowed := at.capPositionSizeByEquity(decision, totalEquity, decision.Symbol)
+	minQty, _, minExecutable := at.minExecutableQuantity(decision.Symbol, marketData.CurrentPrice)
+	if minExecutable > 0 {
+		if maxAllowed > 0 && maxAllowed+1e-9 < minExecutable {
+			actionRecord.Error = fmt.Sprintf("%s 净值限制最大仓位 %.2f USDT，低于交易所最小要求 %.2f USDT",
+				decision.Symbol, maxAllowed, minExecutable)
+			return errDecisionSkipped
+		}
+		if decision.PositionSizeUSD+1e-9 < minExecutable {
+			log.Printf("  ⚠️ %s 最小可执行仓位为 %.4f 数量 (%.2f USDT)，自动提升仓位", decision.Symbol, minQty, minExecutable)
+			decision.PositionSizeUSD = minExecutable
+		}
+	}
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
+	effectiveBalance := availableBalance - at.cycleReservedMargin
+	if effectiveBalance < 0 {
+		effectiveBalance = 0
 	}
 	feeRate := 0.0004
 	unitCost := (1.0 / float64(decision.Leverage)) + feeRate
@@ -816,21 +907,50 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	totalRequired := requiredMargin + estimatedFee
 
 	if totalRequired > availableBalance {
-		adjustedUSD := (availableBalance * 0.99) / unitCost
+		if at.tryIncreaseLeverage(decision, availableBalance, feeRate) {
+			requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
+			estimatedFee = decision.PositionSizeUSD * feeRate
+			totalRequired = requiredMargin + estimatedFee
+			unitCost = (1.0 / float64(decision.Leverage)) + feeRate
+		}
+	}
+
+	if totalRequired > effectiveBalance {
+		if at.tryIncreaseLeverage(decision, effectiveBalance, feeRate) {
+			requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
+			estimatedFee = decision.PositionSizeUSD * feeRate
+			totalRequired = requiredMargin + estimatedFee
+			unitCost = (1.0 / float64(decision.Leverage)) + feeRate
+		}
+	}
+
+	if totalRequired > effectiveBalance {
+		adjustedUSD := (effectiveBalance * 0.99) / unitCost
 		minUSD := util.GetSafeMinPositionUSD(decision.Symbol)
 		if adjustedUSD < minUSD {
-			return fmt.Errorf("❌ 保证金不足: 计划 %.2f USDT，需要 %.2f USDT，可用 %.2f USDT；最大可用仓位 %.2f USDT 低于最小要求 %.2f USDT",
-				decision.PositionSizeUSD, totalRequired, availableBalance, adjustedUSD, minUSD)
+			actionRecord.Error = fmt.Sprintf("保证金不足: 计划 %.2f USDT，需要 %.2f USDT，可用 %.2f USDT；最大可用仓位 %.2f USDT 低于最小要求 %.2f USDT",
+				decision.PositionSizeUSD, totalRequired, effectiveBalance, adjustedUSD, minUSD)
+			return errDecisionSkipped
 		}
 		log.Printf("  ⚠️ 保证金不足，自动将仓位从 %.2f USDT 调整为 %.2f USDT (杠杆 %dx)",
 			decision.PositionSizeUSD, adjustedUSD, decision.Leverage)
 		decision.PositionSizeUSD = adjustedUSD
+		if minExecutable > 0 && decision.PositionSizeUSD+1e-9 < minExecutable {
+			actionRecord.Error = fmt.Sprintf("%s 调整后仓位 %.2f USDT 仍低于最小要求 %.2f USDT",
+				decision.Symbol, decision.PositionSizeUSD, minExecutable)
+			return errDecisionSkipped
+		}
+		at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
 		requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
 		estimatedFee = decision.PositionSizeUSD * feeRate
 		totalRequired = requiredMargin + estimatedFee
 	}
 
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
+	quantity := decision.Quantity
+	if quantity <= 0 {
+		quantity = decision.PositionSizeUSD / marketData.CurrentPrice
+	}
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
@@ -852,6 +972,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
+	at.cycleReservedMargin += totalRequired
 
 	// 记录开仓时间
 	posKey := decision.Symbol + "_long"
@@ -888,6 +1009,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if err != nil {
 		return err
 	}
+	if block, reason := at.shouldBlockShort(decision.Symbol, marketData); block {
+		actionRecord.Error = reason
+		return errDecisionSkipped
+	}
+
+	at.adjustPositionSizeForMinNotional(decision, marketData.CurrentPrice)
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
 
 	feeRate := 0.0004
 
@@ -898,9 +1026,23 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	if err != nil {
 		return fmt.Errorf("获取账户余额失败: %w", err)
 	}
-	availableBalance := 0.0
-	if avail, ok := balance["availableBalance"].(float64); ok {
-		availableBalance = avail
+	availableBalance := getBalanceFloat(balance, "availableBalance")
+	totalEquity := getBalanceFloat(balance, "totalWalletBalance") + getBalanceFloat(balance, "totalUnrealizedProfit")
+	maxAllowed := at.capPositionSizeByEquity(decision, totalEquity, decision.Symbol)
+	minQty, _, minExecutable := at.minExecutableQuantity(decision.Symbol, marketData.CurrentPrice)
+	if minExecutable > 0 {
+		if maxAllowed > 0 && maxAllowed+1e-9 < minExecutable {
+			return fmt.Errorf("❌ 净值限制最大仓位 %.2f USDT，低于最小下单名义 %.2f USDT", maxAllowed, minExecutable)
+		}
+		if decision.PositionSizeUSD+1e-9 < minExecutable {
+			log.Printf("  ⚠️ %s 最小可执行仓位为 %.4f 数量 (%.2f USDT)，自动提升仓位", decision.Symbol, minQty, minExecutable)
+			decision.PositionSizeUSD = minExecutable
+		}
+	}
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
+	effectiveBalance := availableBalance - at.cycleReservedMargin
+	if effectiveBalance < 0 {
+		effectiveBalance = 0
 	}
 	unitCost := (1.0 / float64(decision.Leverage)) + feeRate
 
@@ -908,22 +1050,40 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	estimatedFee := decision.PositionSizeUSD * feeRate
 	totalRequired := requiredMargin + estimatedFee
 
-	if totalRequired > availableBalance {
-		adjustedUSD := (availableBalance * 0.99) / unitCost
+	if totalRequired > effectiveBalance {
+		if at.tryIncreaseLeverage(decision, effectiveBalance, feeRate) {
+			requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
+			estimatedFee = decision.PositionSizeUSD * feeRate
+			totalRequired = requiredMargin + estimatedFee
+			unitCost = (1.0 / float64(decision.Leverage)) + feeRate
+		}
+	}
+
+	if totalRequired > effectiveBalance {
+		adjustedUSD := (effectiveBalance * 0.99) / unitCost
 		minUSD := util.GetSafeMinPositionUSD(decision.Symbol)
 		if adjustedUSD < minUSD {
 			return fmt.Errorf("❌ 保证金不足: 计划 %.2f USDT，需要 %.2f USDT，可用 %.2f USDT；最大可用仓位 %.2f USDT 低于最小要求 %.2f USDT",
-				decision.PositionSizeUSD, totalRequired, availableBalance, adjustedUSD, minUSD)
+				decision.PositionSizeUSD, totalRequired, effectiveBalance, adjustedUSD, minUSD)
 		}
 		log.Printf("  ⚠️ 保证金不足，自动将仓位从 %.2f USDT 调整为 %.2f USDT (杠杆 %dx)",
 			decision.PositionSizeUSD, adjustedUSD, decision.Leverage)
 		decision.PositionSizeUSD = adjustedUSD
+		if minExecutable > 0 && decision.PositionSizeUSD+1e-9 < minExecutable {
+			return fmt.Errorf("❌ %s 调整后仓位 %.2f USDT 仍低于最小要求 %.2f USDT",
+				decision.Symbol, decision.PositionSizeUSD, minExecutable)
+		}
+		at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
 		requiredMargin = decision.PositionSizeUSD / float64(decision.Leverage)
 		estimatedFee = decision.PositionSizeUSD * feeRate
 		totalRequired = requiredMargin + estimatedFee
 	}
 
-	quantity := decision.PositionSizeUSD / marketData.CurrentPrice
+	at.applyQuantityFromNotional(decision, marketData.CurrentPrice)
+	quantity := decision.Quantity
+	if quantity <= 0 {
+		quantity = decision.PositionSizeUSD / marketData.CurrentPrice
+	}
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
@@ -945,6 +1105,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
+	at.cycleReservedMargin += totalRequired
 
 	// 记录开仓时间
 	posKey := decision.Symbol + "_short"
@@ -1050,12 +1211,22 @@ func (at *AutoTrader) executeUpdateStopLossWithRecord(decision *decision.Decisio
 	positionSide := strings.ToUpper(side)
 	positionAmt, _ := targetPosition["positionAmt"].(float64)
 
-	// 验证新止损价格合理性
+	// 验证新止损价格合理性，如不符合则自动调整到当前价附近的安全距离
+	safeGap := math.Max(marketData.CurrentPrice*0.0001, 1.0) // 至少保持万分之一或1U
 	if positionSide == "LONG" && decision.NewStopLoss >= marketData.CurrentPrice {
-		return fmt.Errorf("多单止损必须低于当前价格 (当前: %.2f, 新止损: %.2f)", marketData.CurrentPrice, decision.NewStopLoss)
+		adjusted := marketData.CurrentPrice - safeGap
+		if adjusted <= 0 {
+			adjusted = marketData.CurrentPrice * 0.99
+		}
+		log.Printf("  ⚠️ 多单止损 %.2f 不低于当前价 %.2f，自动下调到 %.2f",
+			decision.NewStopLoss, marketData.CurrentPrice, adjusted)
+		decision.NewStopLoss = adjusted
 	}
 	if positionSide == "SHORT" && decision.NewStopLoss <= marketData.CurrentPrice {
-		return fmt.Errorf("空单止损必须高于当前价格 (当前: %.2f, 新止损: %.2f)", marketData.CurrentPrice, decision.NewStopLoss)
+		adjusted := marketData.CurrentPrice + safeGap
+		log.Printf("  ⚠️ 空单止损 %.2f 不高于当前价 %.2f，自动上调到 %.2f",
+			decision.NewStopLoss, marketData.CurrentPrice, adjusted)
+		decision.NewStopLoss = adjusted
 	}
 
 	// ⚠️ 防御性检查：检测是否存在双向持仓（不应该出现，但提供保护）
@@ -1319,6 +1490,491 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		"last_reset_time": at.lastResetTime.Format(time.RFC3339),
 		"ai_provider":     aiProvider,
 	}
+}
+
+func (at *AutoTrader) tryIncreaseLeverage(decision *decision.Decision, availableBalance, feeRate float64) bool {
+	maxLev := at.maxLeverageForSymbol(decision.Symbol)
+	if maxLev <= decision.Leverage {
+		return false
+	}
+	denom := availableBalance - (decision.PositionSizeUSD * feeRate)
+	if denom <= 0 {
+		return false
+	}
+	required := int(math.Ceil(decision.PositionSizeUSD / denom))
+	if required <= decision.Leverage {
+		required = decision.Leverage + 1
+	}
+	if required > maxLev {
+		required = maxLev
+	}
+	if required <= decision.Leverage {
+		return false
+	}
+	log.Printf("  ⚙️ 杠杆不足，自动将 %s 杠杆从 %dx 提升至 %dx 以满足保证金", decision.Symbol, decision.Leverage, required)
+	decision.Leverage = required
+	return true
+}
+
+func (at *AutoTrader) maxLeverageForSymbol(symbol string) int {
+	upper := strings.ToUpper(symbol)
+
+	base := 5
+	if upper == "BTCUSDT" || upper == "ETHUSDT" {
+		if at.config.BTCETHLeverage > 0 {
+			base = at.config.BTCETHLeverage
+		}
+	} else if at.config.AltcoinLeverage > 0 {
+		base = at.config.AltcoinLeverage
+	}
+
+	// 资金过小（<50 USDT）时，允许最高 50x 以满足最小名义
+	equity := at.lastCycleEquity
+	if equity == 0 {
+		equity = at.initialBalance
+	}
+	if equity > 0 && equity < 50 && base < 50 {
+		log.Printf("  ⚙️ 净值 %.2f USDT 过低，将 %s 允许杠杆提升至 50x 以满足最小名义", equity, symbol)
+		return 50
+	}
+
+	return base
+}
+
+func (at *AutoTrader) adjustPositionSizeForMinNotional(decision *decision.Decision, currentPrice float64) {
+	if decision == nil || currentPrice <= 0 || decision.PositionSizeUSD <= 0 {
+		return
+	}
+
+	minQuantity, step, minNotional := at.minExecutableQuantity(decision.Symbol, currentPrice)
+	if minQuantity <= 0 || minNotional <= 0 {
+		return
+	}
+
+	computedQuantity := decision.PositionSizeUSD / currentPrice
+	if computedQuantity+1e-9 < minQuantity {
+		log.Printf("  ⚠️ %s 仓位名义 %.2f USDT 低于最小要求 %.2f USDT，按步长 %.4f 自动提升至 %.2f USDT",
+			decision.Symbol, decision.PositionSizeUSD, minNotional, step, minNotional)
+		decision.PositionSizeUSD = minNotional
+	}
+}
+
+func (at *AutoTrader) getSymbolPrecisionOrDefault(symbol string) int {
+	precision := 3
+	if precGetter, ok := at.trader.(interface {
+		GetSymbolPrecision(string) (int, error)
+	}); ok {
+		if p, err := precGetter.GetSymbolPrecision(symbol); err == nil && p >= 0 {
+			precision = p
+		}
+	}
+	return precision
+}
+
+func (at *AutoTrader) minExecutableQuantity(symbol string, price float64) (float64, float64, float64) {
+	if price <= 0 {
+		return 0, 0, 0
+	}
+
+	precision := at.getSymbolPrecisionOrDefault(symbol)
+	step := math.Pow(10, -float64(precision))
+	if step <= 0 {
+		step = 0.001
+	}
+
+	minNotional := util.GetMinNotionalUSD(symbol)
+	if minNotional <= 0 {
+		return 0, step, 0
+	}
+
+	minQuantitySteps := math.Ceil((minNotional / price) / step)
+	if minQuantitySteps <= 0 {
+		minQuantitySteps = 1
+	}
+
+	minQuantity := minQuantitySteps * step
+	minNotional = minQuantity * price
+	return minQuantity, step, minNotional
+}
+
+func (at *AutoTrader) evaluateRiskTriggers(ctx *decision.Context, equityDropPct float64, onFailure bool) (float64, string) {
+	if ctx == nil || len(ctx.Positions) == 0 {
+		return 0, ""
+	}
+
+	margin := ctx.Account.MarginUsedPct
+	if margin >= 80 {
+		return 0.5, fmt.Sprintf("保证金利用率 %.1f%% 超过 80%%", margin)
+	}
+
+	if equityDropPct >= 5 {
+		return 0.3, fmt.Sprintf("净值较上一周期下降 %.2f%%", equityDropPct)
+	}
+
+	for _, pos := range ctx.Positions {
+		if pos.UnrealizedPnLPct <= -1.2 || margin >= 70 {
+			return 0.3, fmt.Sprintf("浮亏 %.2f%% / 占用 %.1f%% 触发自动减仓", pos.UnrealizedPnLPct, margin)
+		}
+	}
+
+	if onFailure {
+		return 0.25, "AI 决策失败，触发安全减仓"
+	}
+
+	return 0, ""
+}
+
+func (at *AutoTrader) enforceTimeStop(ctx *decision.Context, record *logger.DecisionRecord) (bool, error) {
+	if ctx == nil || len(ctx.Positions) == 0 {
+		return false, nil
+	}
+
+	now := time.Now()
+	triggered := false
+
+	for _, pos := range ctx.Positions {
+		if pos.UpdateTime == 0 {
+			continue
+		}
+		heldDuration := now.Sub(time.Unix(0, pos.UpdateTime*int64(time.Millisecond)))
+		if heldDuration < timeStopSoftLimit {
+			continue
+		}
+
+		if heldDuration < timeStopHardLimit && pos.UnrealizedPnLPct > 0.6 {
+			continue
+		}
+
+		var err error
+		if strings.ToLower(pos.Side) == "short" {
+			_, err = at.trader.CloseShort(pos.Symbol, pos.Quantity)
+		} else {
+			_, err = at.trader.CloseLong(pos.Symbol, pos.Quantity)
+		}
+		if err != nil {
+			return true, err
+		}
+
+		triggered = true
+		reason := fmt.Sprintf("持仓 %.2f%% / 时长 %.0f 分钟，触发时间止损", pos.UnrealizedPnLPct, heldDuration.Minutes())
+		record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("⏱ %s %s", pos.Symbol, reason))
+		record.Decisions = append(record.Decisions, logger.DecisionAction{
+			Action:    "time_stop_close",
+			Symbol:    pos.Symbol,
+			Quantity:  pos.Quantity,
+			Leverage:  pos.Leverage,
+			Price:     pos.MarkPrice,
+			Timestamp: time.Now(),
+			Success:   true,
+		})
+	}
+
+	return triggered, nil
+}
+
+func (at *AutoTrader) executeAutoPartialClose(ctx *decision.Context, record *logger.DecisionRecord, ratio float64, reason string) error {
+	if ctx == nil || len(ctx.Positions) == 0 {
+		return fmt.Errorf("没有持仓可供减仓")
+	}
+
+	pos := ctx.Positions[0]
+	quantity := pos.Quantity * ratio
+	minQuantity := math.Max(pos.Quantity*0.1, 0.0001)
+	if quantity < minQuantity {
+		quantity = minQuantity
+	}
+	if quantity > pos.Quantity {
+		quantity = pos.Quantity
+	}
+
+	var err error
+	if strings.ToLower(pos.Side) == "short" {
+		_, err = at.trader.CloseShort(pos.Symbol, quantity)
+	} else {
+		_, err = at.trader.CloseLong(pos.Symbol, quantity)
+	}
+	if err != nil {
+		return err
+	}
+
+	record.ExecutionLog = append(record.ExecutionLog,
+		fmt.Sprintf("⚠️ 自动减仓 %.4f %s (%s)", quantity, pos.Symbol, reason))
+	record.Decisions = append(record.Decisions, logger.DecisionAction{
+		Action:    "auto_partial_close",
+		Symbol:    pos.Symbol,
+		Quantity:  quantity,
+		Leverage:  pos.Leverage,
+		Price:     pos.MarkPrice,
+		Timestamp: time.Now(),
+		Success:   true,
+	})
+	return nil
+}
+
+func (at *AutoTrader) shouldBlockLong(symbol string, data *market.Data) (bool, string) {
+	if data == nil {
+		return false, ""
+	}
+
+	// ✅ 极度超卖例外：允许反弹交易
+	// 当短期 RSI(7) < 20 且跌幅较大时，允许小仓位抄底
+	if data.CurrentRSI7 > 0 && data.CurrentRSI7 < 20 && data.PriceChange1h < -1.0 {
+		// 极度超卖，允许做多反弹，但需要 AI 自己判断风险
+		return false, ""
+	}
+
+	ltc := data.LongerTermContext
+	emaBear := false
+	macdBear := false
+	rsiBear := false
+	if ltc != nil {
+		if ltc.EMA20 > 0 && ltc.EMA50 > 0 && ltc.EMA20 < ltc.EMA50 {
+			emaBear = true
+		}
+		if len(ltc.MACDValues) > 0 && ltc.MACDValues[len(ltc.MACDValues)-1] < 0 {
+			macdBear = true
+		}
+		if len(ltc.RSI14Values) > 0 && ltc.RSI14Values[len(ltc.RSI14Values)-1] < 45 {
+			rsiBear = true
+		}
+	}
+
+	priceDown := data.PriceChange1h <= -0.2 && data.PriceChange4h <= -0.5
+
+	if (emaBear && macdBear) || (macdBear && rsiBear) || (emaBear && priceDown) || (rsiBear && priceDown) {
+		var macdVal, rsiVal float64
+		if ltc != nil && len(ltc.MACDValues) > 0 {
+			macdVal = ltc.MACDValues[len(ltc.MACDValues)-1]
+		}
+		if ltc != nil && len(ltc.RSI14Values) > 0 {
+			rsiVal = ltc.RSI14Values[len(ltc.RSI14Values)-1]
+		}
+		reason := fmt.Sprintf("4h趋势向下：EMA20 %.0f < EMA50 %.0f, MACD %.1f, RSI14 %.1f, 1h %.2f%% / 4h %.2f%%",
+			ltc.EMA20, ltc.EMA50, macdVal, rsiVal, data.PriceChange1h, data.PriceChange4h)
+		return true, reason
+	}
+
+	return false, ""
+}
+
+func (at *AutoTrader) shouldBlockShort(symbol string, data *market.Data) (bool, string) {
+	if data == nil {
+		return false, ""
+	}
+
+	// ✅ 极度超买例外：允许回调做空
+	// 当短期 RSI(7) > 80 且涨幅较大时，允许小仓位做空回调
+	if data.CurrentRSI7 > 0 && data.CurrentRSI7 > 80 && data.PriceChange1h > 1.0 {
+		// 极度超买，允许做空回调，但需要 AI 自己判断风险
+		return false, ""
+	}
+
+	ltc := data.LongerTermContext
+	emaBull := false
+	macdBull := false
+	rsiBull := false
+	if ltc != nil {
+		if ltc.EMA20 > 0 && ltc.EMA50 > 0 && ltc.EMA20 > ltc.EMA50 {
+			emaBull = true
+		}
+		if len(ltc.MACDValues) > 0 && ltc.MACDValues[len(ltc.MACDValues)-1] > 0 {
+			macdBull = true
+		}
+		if len(ltc.RSI14Values) > 0 && ltc.RSI14Values[len(ltc.RSI14Values)-1] > 55 {
+			rsiBull = true
+		}
+	}
+	priceUp := data.PriceChange1h >= 0.2 && data.PriceChange4h >= 0.5
+
+	if (emaBull && macdBull) || (macdBull && rsiBull) || (emaBull && priceUp) || (rsiBull && priceUp) {
+		var macdVal, rsiVal float64
+		if ltc != nil && len(ltc.MACDValues) > 0 {
+			macdVal = ltc.MACDValues[len(ltc.MACDValues)-1]
+		}
+		if ltc != nil && len(ltc.RSI14Values) > 0 {
+			rsiVal = ltc.RSI14Values[len(ltc.RSI14Values)-1]
+		}
+		reason := fmt.Sprintf("4h趋势上行：EMA20 %.0f > EMA50 %.0f, MACD %.1f, RSI14 %.1f, 1h %.2f%% / 4h %.2f%%",
+			ltc.EMA20, ltc.EMA50, macdVal, rsiVal, data.PriceChange1h, data.PriceChange4h)
+		return true, reason
+	}
+
+	return false, ""
+}
+
+func (at *AutoTrader) capPositionSizeByEquity(decision *decision.Decision, totalEquity float64, symbol string) float64 {
+	if totalEquity <= 0 || decision == nil {
+		return 0
+	}
+
+	template := strings.ToLower(at.systemPromptTemplate)
+	switch template {
+	case "btc_50x_roller":
+		return at.capPositionWithSpec(decision, totalEquity, symbol, 50, 450, 800)
+	case "btc_100x_flash":
+		return at.capPositionWithSpec(decision, totalEquity, symbol, 100, 120, 300)
+	}
+
+	var multiplier float64
+	switch {
+	case totalEquity < 40:
+		multiplier = 2.5
+	case totalEquity < 60:
+		multiplier = 3.0
+	case totalEquity < 80:
+		multiplier = 3.5
+	default:
+		multiplier = 4.0
+	}
+
+	maxAllowed := totalEquity * multiplier
+	minUSD := util.GetSafeMinPositionUSD(symbol)
+	if maxAllowed < minUSD {
+		maxAllowed = minUSD
+	}
+
+	if decision.PositionSizeUSD > maxAllowed {
+		log.Printf("  ⚠️ 根据净值 %.2f 限制仓位名义，从 %.2f → %.2f USDT", totalEquity, decision.PositionSizeUSD, maxAllowed)
+		decision.PositionSizeUSD = maxAllowed
+	}
+
+	if decision.PositionSizeUSD < minUSD {
+		log.Printf("  ⚠️ 名义 %.2f USDT 低于最小要求 %.2f，尝试提升杠杆/仓位", decision.PositionSizeUSD, minUSD)
+		decision.PositionSizeUSD = minUSD
+	}
+
+	return maxAllowed
+}
+
+func (at *AutoTrader) capPositionWithSpec(decision *decision.Decision, totalEquity float64, symbol string, leverage float64, minFloor float64, maxCap float64) float64 {
+	if decision == nil || totalEquity <= 0 {
+		return 0
+	}
+
+	minUSD := util.GetSafeMinPositionUSD(symbol)
+	if minFloor > 0 && minUSD < minFloor {
+		minUSD = minFloor
+	}
+
+	maxUSD := totalEquity * leverage
+	if maxCap > 0 && maxUSD > maxCap {
+		maxUSD = maxCap
+	}
+	if maxUSD < minUSD {
+		maxUSD = minUSD
+	}
+
+	if decision.PositionSizeUSD > maxUSD {
+		log.Printf("  ⚠️ [%s] 根据净值 %.2f 限制仓位名义，从 %.2f → %.2f USDT",
+			symbol, totalEquity, decision.PositionSizeUSD, maxUSD)
+		decision.PositionSizeUSD = maxUSD
+	}
+
+	if decision.PositionSizeUSD < minUSD {
+		log.Printf("  ⚠️ [%s] 名义 %.2f 低于策略最小要求 %.2f，自动抬升仓位",
+			symbol, decision.PositionSizeUSD, minUSD)
+		decision.PositionSizeUSD = minUSD
+	}
+
+	return maxUSD
+}
+
+// ForceCloseAllPositions 手动强制平掉当前账户的所有仓位
+func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return 0, fmt.Errorf("获取持仓失败: %w", err)
+	}
+
+	closed := 0
+	for _, pos := range positions {
+		symbol, _ := pos["symbol"].(string)
+		side, _ := pos["side"].(string)
+		quantity := getMapFloat(pos, "quantity")
+
+		if symbol == "" || quantity <= 0 {
+			continue
+		}
+
+		if err := at.trader.CancelStopOrders(symbol); err != nil {
+			log.Printf("⚠️ [%s] 手动平仓取消止盈/止损失败 %s: %v", at.name, symbol, err)
+		}
+
+		switch strings.ToLower(side) {
+		case "long":
+			if _, err := at.trader.CloseLong(symbol, 0); err != nil {
+				return closed, fmt.Errorf("平多仓 %s 失败: %w", symbol, err)
+			}
+		case "short":
+			if _, err := at.trader.CloseShort(symbol, 0); err != nil {
+				return closed, fmt.Errorf("平空仓 %s 失败: %w", symbol, err)
+			}
+		default:
+			log.Printf("⚠️ [%s] 未知的持仓方向 %s (%s)，跳过手动平仓", at.name, side, symbol)
+			continue
+		}
+
+		closed++
+		log.Printf("🛑 [%s] 手动平仓 %s %s (reason=%s)", at.name, symbol, side, reason)
+	}
+
+	return closed, nil
+}
+
+func getBalanceFloat(balance map[string]interface{}, key string) float64 {
+	if val, ok := balance[key].(float64); ok {
+		return val
+	}
+	return 0
+}
+
+func getMapFloat(data map[string]interface{}, key string) float64 {
+	if val, ok := data[key]; ok {
+		switch v := val.(type) {
+		case float64:
+			return v
+		case float32:
+			return float64(v)
+		case int:
+			return float64(v)
+		case int64:
+			return float64(v)
+		case string:
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func (at *AutoTrader) applyQuantityFromNotional(decision *decision.Decision, price float64) {
+	if decision == nil || price <= 0 {
+		return
+	}
+
+	target := decision.PositionSizeUSD / price
+	if target <= 0 {
+		return
+	}
+
+	precision := at.getSymbolPrecisionOrDefault(decision.Symbol)
+	step := math.Pow(10, -float64(precision))
+	if step <= 0 {
+		step = 0.001
+	}
+
+	steps := math.Floor((target / step) + 1e-9)
+	if steps <= 0 {
+		steps = 1
+	}
+	quantized := steps * step
+
+	if math.Abs(quantized-decision.Quantity) > 0.000001 {
+		log.Printf("  ⚙️ 依据名义 %.2f USDT 调整下单数量: %.6f → %.6f", decision.PositionSizeUSD, decision.Quantity, quantized)
+	}
+	decision.Quantity = quantized
+	decision.PositionSizeUSD = quantized * price
 }
 
 // GetAccountInfo 获取账户信息（用于API）
