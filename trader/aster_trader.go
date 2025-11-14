@@ -567,6 +567,11 @@ func (t *AsterTrader) GetPositions() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// ClearPositionsCache Aster交易所不使用缓存，空实现
+func (t *AsterTrader) ClearPositionsCache() {
+	// Aster交易所直接调用API，无缓存，无需清理
+}
+
 // OpenLong 开多单
 func (t *AsterTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	// 开仓前先取消所有挂单,防止残留挂单导致仓位叠加

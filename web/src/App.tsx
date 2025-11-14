@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import useSWR from 'swr'
+import useSWR, { useSWRConfig } from 'swr'
 import { api } from './lib/api'
 import { EquityChart } from './components/EquityChart'
 import { AITradersPage } from './components/AITradersPage'
@@ -147,9 +147,9 @@ function App() {
       : null,
     () => api.getPositions(selectedTraderId),
     {
-      refreshInterval: 15000, // 15秒刷新（配合后端15秒缓存）
-      revalidateOnFocus: false, // 禁用聚焦时重新验证，减少请求
-      dedupingInterval: 10000, // 10秒去重，防止短时间内重复请求
+      refreshInterval: 5000, // 5秒刷新（实时更新持仓状态）
+      revalidateOnFocus: true, // 启用聚焦时重新验证（用户切换回页面时立即刷新）
+      dedupingInterval: 3000, // 3秒去重，允许更频繁的刷新
     }
   )
 
@@ -441,6 +441,80 @@ function TraderDetailsPage({
   lastUpdate: string
   language: Language
 }) {
+  const { mutate } = useSWRConfig()
+  const [isForceClosing, setIsForceClosing] = useState(false)
+  const [isSyncingBalance, setIsSyncingBalance] = useState(false)
+
+  const handleManualClosePositions = async () => {
+    if (!selectedTraderId || isForceClosing) return
+
+    // Check current position count
+    const positionCount = positions?.length || 0
+
+    // Show appropriate message if no positions
+    if (positionCount === 0) {
+      alert(t('manualCloseNoPosition', language))
+      return
+    }
+
+    // Show confirmation dialog with position count
+    if (!confirm(t('manualCloseConfirm', language, { count: positionCount }))) {
+      return
+    }
+
+    try {
+      setIsForceClosing(true)
+      const response = await fetch(`/api/traders/${selectedTraderId}/close-all`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('auth_token')}`,
+          'Content-Type': 'application/json',
+        },
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to close positions')
+      }
+
+      const result = await response.json()
+      const closedCount = result.closed_positions || 0
+
+      // Refresh data
+      await Promise.all([
+        mutate(`positions-${selectedTraderId}`),
+        mutate(`account-${selectedTraderId}`),
+        mutate(`status-${selectedTraderId}`),
+      ])
+
+      // Show success message with count
+      alert(t('manualCloseSuccess', language, { count: closedCount }))
+    } catch (error) {
+      console.error('Failed to close positions:', error)
+      alert(t('manualCloseFailed', language))
+    } finally {
+      setIsForceClosing(false)
+    }
+  }
+
+  const handleManualSyncBalance = async () => {
+    if (!selectedTraderId || isSyncingBalance) return
+    try {
+      setIsSyncingBalance(true)
+      await api.syncBalance(selectedTraderId)
+      await Promise.all([
+        mutate(`positions-${selectedTraderId}`),
+        mutate(`account-${selectedTraderId}`),
+        mutate(`status-${selectedTraderId}`),
+      ])
+      alert(t('manualSyncSuccess', language))
+    } catch (error) {
+      console.error('Failed to sync balance:', error)
+      alert(t('manualSyncFailed', language))
+    } finally {
+      setIsSyncingBalance(false)
+    }
+  }
+
   if (!selectedTrader) {
     return (
       <div className="space-y-6">
@@ -554,20 +628,29 @@ function TraderDetailsPage({
       </div>
 
       {/* Debug Info */}
-      {account && (
-        <div
-          className="mb-4 p-3 rounded text-xs font-mono"
-          style={{ background: '#1E2329', border: '1px solid #2B3139' }}
-        >
-          <div style={{ color: '#848E9C' }}>
-            🔄 Last Update: {lastUpdate} | Total Equity:{' '}
-            {account?.total_equity?.toFixed(2) || '0.00'} | Available:{' '}
-            {account?.available_balance?.toFixed(2) || '0.00'} | P&L:{' '}
-            {account?.total_pnl?.toFixed(2) || '0.00'} (
-            {account?.total_pnl_pct?.toFixed(2) || '0.00'}%)
-          </div>
-        </div>
-      )}
+  {account && (
+    <div
+      className="mb-4 p-3 rounded text-xs font-mono flex flex-wrap items-center justify-between gap-3"
+      style={{ background: '#1E2329', border: '1px solid #2B3139' }}
+    >
+      <div style={{ color: '#848E9C' }}>
+        🔄 Last Update: {lastUpdate} | Total Equity:{' '}
+        {account?.total_equity?.toFixed(2) || '0.00'} | Available:{' '}
+        {account?.available_balance?.toFixed(2) || '0.00'} | P&L:{' '}
+        {account?.total_pnl?.toFixed(2) || '0.00'} (
+        {account?.total_pnl_pct?.toFixed(2) || '0.00'}%)
+      </div>
+      <button
+        onClick={handleManualSyncBalance}
+        disabled={isSyncingBalance}
+        className="text-xs px-3 py-1 rounded border border-blue-500 text-blue-300 hover:bg-blue-500/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+      >
+        {isSyncingBalance
+          ? t('manualSyncInProgress', language)
+          : t('manualSync', language)}
+      </button>
+    </div>
+  )}
 
       {/* Account Overview */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
@@ -609,25 +692,38 @@ function TraderDetailsPage({
             className="binance-card p-6 animate-slide-in"
             style={{ animationDelay: '0.15s' }}
           >
-            <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center justify-between mb-5 gap-3">
               <h2
                 className="text-xl font-bold flex items-center gap-2"
                 style={{ color: '#EAECEF' }}
               >
                 📈 {t('currentPositions', language)}
               </h2>
-              {positions && positions.length > 0 && (
-                <div
-                  className="text-xs px-3 py-1 rounded"
-                  style={{
-                    background: 'rgba(240, 185, 11, 0.1)',
-                    color: '#F0B90B',
-                    border: '1px solid rgba(240, 185, 11, 0.2)',
-                  }}
-                >
-                  {positions.length} {t('active', language)}
-                </div>
-              )}
+              <div className="flex items-center gap-3">
+                {positions && positions.length > 0 && (
+                  <div
+                    className="text-xs px-3 py-1 rounded"
+                    style={{
+                      background: 'rgba(240, 185, 11, 0.1)',
+                      color: '#F0B90B',
+                      border: '1px solid rgba(240, 185, 11, 0.2)',
+                    }}
+                  >
+                    {positions.length} {t('active', language)}
+                  </div>
+                )}
+                {positions && positions.length > 0 && (
+                  <button
+                    onClick={handleManualClosePositions}
+                    disabled={isForceClosing}
+                    className="text-xs px-3 py-1 rounded border border-red-500 text-red-400 hover:bg-red-500/10 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isForceClosing
+                      ? t('manualCloseInProgress', language)
+                      : t('manualClose', language)}
+                  </button>
+                )}
+              </div>
             </div>
             {positions && positions.length > 0 ? (
               <div className="overflow-x-auto">

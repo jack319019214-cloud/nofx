@@ -306,6 +306,11 @@ func (t *HyperliquidTrader) GetPositions() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// ClearPositionsCache Hyperliquid不使用缓存，空实现
+func (t *HyperliquidTrader) ClearPositionsCache() {
+	// Hyperliquid直接调用API，无缓存，无需清理
+}
+
 // SetMarginMode 设置仓位模式 (在SetLeverage时一并设置)
 func (t *HyperliquidTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	// Hyperliquid的仓位模式在SetLeverage时设置，这里只记录

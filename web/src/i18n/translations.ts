@@ -33,6 +33,18 @@ export const translations = {
     positions: 'Positions',
     margin: 'Margin',
     free: 'Free',
+    manualClose: 'Manual Close',
+    manualCloseConfirm:
+      'Current positions: {count}. Confirm to close all positions?',
+    manualCloseNoPosition: 'No positions to close',
+    manualCloseSuccess:
+      'Successfully closed {count} position(s)',
+    manualCloseFailed: 'Failed to close positions, please retry.',
+    manualCloseInProgress: 'Closing…',
+    manualSync: 'Sync Balance',
+    manualSyncSuccess: 'Balance synced with exchange.',
+    manualSyncFailed: 'Sync failed, please retry.',
+    manualSyncInProgress: 'Syncing…',
 
     // Positions Table
     currentPositions: 'Current Positions',
@@ -785,6 +797,16 @@ export const translations = {
     positions: '持仓',
     margin: '保证金',
     free: '空闲',
+    manualClose: '手动平仓',
+    manualCloseConfirm: '当前持仓：{count}个，确定全部平仓吗？',
+    manualCloseNoPosition: '当前无持仓可平',
+    manualCloseSuccess: '成功平掉 {count} 个持仓',
+    manualCloseFailed: '平仓失败，请稍后重试。',
+    manualCloseInProgress: '正在平仓…',
+    manualSync: '同步余额',
+    manualSyncSuccess: '已与交易所余额同步。',
+    manualSyncFailed: '同步失败，请重试。',
+    manualSyncInProgress: '正在同步…',
 
     // Positions Table
     currentPositions: '当前持仓',

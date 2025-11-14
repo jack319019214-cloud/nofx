@@ -9,6 +9,9 @@ type Trader interface {
 	// GetPositions 获取所有持仓
 	GetPositions() ([]map[string]interface{}, error)
 
+	// ClearPositionsCache 清除持仓缓存（用于手动平仓等需要强制刷新的场景）
+	ClearPositionsCache()
+
 	// OpenLong 开多仓
 	OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error)
 

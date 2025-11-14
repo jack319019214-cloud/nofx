@@ -1717,8 +1717,10 @@ func (at *AutoTrader) shouldBlockLong(symbol string, data *market.Data) (bool, s
 	}
 
 	// ✅ 极度超卖例外：允许反弹交易
-	// 当短期 RSI(7) < 20 且跌幅较大时，允许小仓位抄底
-	if data.CurrentRSI7 > 0 && data.CurrentRSI7 < 20 && data.PriceChange1h < -1.0 {
+	// 优化版：降低门槛，在较温和的超卖时也允许小仓位试单
+	// 条件1：RSI7 < 25 且 1h跌幅 < -0.5%（放宽条件）
+	// 条件2：RSI7 < 20（极度超卖，即使跌幅小也允许）
+	if data.CurrentRSI7 > 0 && ((data.CurrentRSI7 < 25 && data.PriceChange1h < -0.5) || data.CurrentRSI7 < 20) {
 		// 极度超卖，允许做多反弹，但需要 AI 自己判断风险
 		return false, ""
 	}
@@ -1763,8 +1765,10 @@ func (at *AutoTrader) shouldBlockShort(symbol string, data *market.Data) (bool, 
 	}
 
 	// ✅ 极度超买例外：允许回调做空
-	// 当短期 RSI(7) > 80 且涨幅较大时，允许小仓位做空回调
-	if data.CurrentRSI7 > 0 && data.CurrentRSI7 > 80 && data.PriceChange1h > 1.0 {
+	// 优化版：降低门槛，在较温和的超买时也允许小仓位试单
+	// 条件1：RSI7 > 75 且 1h涨幅 > 0.5%（放宽条件）
+	// 条件2：RSI7 > 80（极度超买，即使涨幅小也允许）
+	if data.CurrentRSI7 > 0 && ((data.CurrentRSI7 > 75 && data.PriceChange1h > 0.5) || data.CurrentRSI7 > 80) {
 		// 极度超买，允许做空回调，但需要 AI 自己判断风险
 		return false, ""
 	}
@@ -1881,6 +1885,9 @@ func (at *AutoTrader) capPositionWithSpec(decision *decision.Decision, totalEqui
 
 // ForceCloseAllPositions 手动强制平掉当前账户的所有仓位
 func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
+	// 手动平仓时强制清除缓存，确保获取最新持仓信息
+	at.trader.ClearPositionsCache()
+
 	positions, err := at.trader.GetPositions()
 	if err != nil {
 		return 0, fmt.Errorf("获取持仓失败: %w", err)

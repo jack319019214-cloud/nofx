@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -310,6 +311,15 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 	t.positionsCacheMutex.Unlock()
 
 	return result, nil
+}
+
+// ClearPositionsCache 清除持仓缓存（用于手动平仓等需要强制刷新的场景）
+func (t *FuturesTrader) ClearPositionsCache() {
+	t.positionsCacheMutex.Lock()
+	t.cachedPositions = nil
+	t.positionsCacheTime = time.Time{} // 重置为零值
+	t.positionsCacheMutex.Unlock()
+	log.Printf("🔄 已清除持仓缓存，下次查询将强制调用币安API")
 }
 
 // SetMarginMode 设置仓位模式
@@ -835,12 +845,17 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		return err
 	}
 
+	priceStr, err := t.FormatPrice(symbol, stopPrice)
+	if err != nil {
+		return err
+	}
+
 	_, err = t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeStopMarket).
-		StopPrice(fmt.Sprintf("%.8f", stopPrice)).
+		StopPrice(priceStr).
 		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
@@ -901,12 +916,17 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		return err
 	}
 
+	priceStr, err := t.FormatPrice(symbol, takeProfitPrice)
+	if err != nil {
+		return err
+	}
+
 	_, err = t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeTakeProfitMarket).
-		StopPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
+		StopPrice(priceStr).
 		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
@@ -1023,6 +1043,47 @@ func (t *FuturesTrader) FormatQuantity(symbol string, quantity float64) (string,
 
 	format := fmt.Sprintf("%%.%df", precision)
 	return fmt.Sprintf(format, quantity), nil
+}
+
+// FormatPrice 根据 tickSize 对齐价格精度
+func (t *FuturesTrader) FormatPrice(symbol string, price float64) (string, error) {
+	precision, tickSize, err := t.getPriceFormatInfo(symbol)
+	if err != nil {
+		return "", err
+	}
+
+	if tickSize > 0 {
+		price = math.Round(price/tickSize) * tickSize
+	}
+
+	format := fmt.Sprintf("%%.%df", precision)
+	return fmt.Sprintf(format, price), nil
+}
+
+func (t *FuturesTrader) getPriceFormatInfo(symbol string) (int, float64, error) {
+	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取交易规则失败: %w", err)
+	}
+
+	for _, s := range exchangeInfo.Symbols {
+		if s.Symbol != symbol {
+			continue
+		}
+		for _, filter := range s.Filters {
+			if filter["filterType"] == "PRICE_FILTER" {
+				tickSizeStr := filter["tickSize"].(string)
+				precision := calculatePrecision(tickSizeStr)
+				tickSize, err := strconv.ParseFloat(tickSizeStr, 64)
+				if err != nil {
+					return 0, 0, fmt.Errorf("解析 tickSize 失败: %w", err)
+				}
+				return precision, tickSize, nil
+			}
+		}
+	}
+
+	return 0, 0, fmt.Errorf("%s 未找到 PRICE_FILTER 信息", symbol)
 }
 
 // 辅助函数
