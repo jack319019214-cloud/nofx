@@ -128,6 +128,7 @@ func (s *Server) setupRoutes() {
 			protected.DELETE("/traders/:id", s.handleDeleteTrader)
 			protected.POST("/traders/:id/start", s.handleStartTrader)
 			protected.POST("/traders/:id/stop", s.handleStopTrader)
+			protected.POST("/traders/:id/close-all", s.handleForceClosePositions)
 			protected.PUT("/traders/:id/prompt", s.handleUpdateTraderPrompt)
 			protected.PUT("/traders/:id/baseline", s.handleUpdateBaseline)
 			protected.POST("/traders/:id/sync-balance", s.handleSyncBalance)
@@ -845,6 +846,39 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 
 	log.Printf("⏹  交易员 %s 已停止", trader.GetName())
 	c.JSON(http.StatusOK, gin.H{"message": "交易员已停止"})
+}
+
+// handleForceClosePositions 手动平掉所有持仓
+func (s *Server) handleForceClosePositions(c *gin.Context) {
+	userID := c.GetString("user_id")
+	traderID := c.Param("id")
+
+	// 校验交易员归属
+	if _, _, _, err := s.database.GetTraderConfig(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "交易员不存在或无访问权限"})
+		return
+	}
+
+	at, err := s.traderManager.GetTrader(traderID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "交易员不存在"})
+		return
+	}
+
+	closed, err := at.ForceCloseAllPositions("manual_force_close")
+	if err != nil {
+		log.Printf("❌ 手动平仓失败 [%s]: %v", traderID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("平仓失败: %v", err),
+		})
+		return
+	}
+
+	log.Printf("🛑 手动平仓完成 [%s]，平掉 %d 个持仓", traderID, closed)
+	c.JSON(http.StatusOK, gin.H{
+		"message":          "所有持仓已执行平仓",
+		"closed_positions": closed,
+	})
 }
 
 // handleUpdateTraderPrompt 更新交易员自定义Prompt

@@ -114,6 +114,28 @@ export const api = {
     return res.json()
   },
 
+  async forceClosePositions(traderId: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/traders/${traderId}/close-all`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    })
+    if (!res.ok) {
+      const message = await res.text()
+      throw new Error(message || '手动平仓失败')
+    }
+  },
+
+  async syncBalance(traderId: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/traders/${traderId}/sync-balance`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    })
+    if (!res.ok) {
+      const message = await res.text()
+      throw new Error(message || '同步余额失败')
+    }
+  },
+
   // AI模型配置接口
   async getModelConfigs(): Promise<AIModel[]> {
     const res = await fetch(`${API_BASE}/models`, {

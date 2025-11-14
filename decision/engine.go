@@ -96,6 +96,7 @@ type Decision struct {
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
+	EntryPrice      float64 `json:"entry_price,omitempty"`
 
 	// 调整参数（新增）
 	NewStopLoss     float64 `json:"new_stop_loss,omitempty"`    // 用于 update_stop_loss
@@ -106,6 +107,37 @@ type Decision struct {
 	Confidence int     `json:"confidence,omitempty"` // 信心度 (0-100)
 	RiskUSD    float64 `json:"risk_usd,omitempty"`   // 最大美元风险
 	Reasoning  string  `json:"reasoning"`
+
+	// 兼容额外字段（某些模型会输出自定义schema）
+	AmountType                string    `json:"amount_type,omitempty"`
+	AmountValue               float64   `json:"amount_value,omitempty"`
+	Percentage                float64   `json:"percentage,omitempty"`
+	PercentAlias              float64   `json:"percent,omitempty"`
+	Quantity                  float64   `json:"quantity,omitempty"`
+	LimitPrice                float64   `json:"limit_price,omitempty"`
+	OpenPrice                 float64   `json:"open_price,omitempty"`
+	Price                     float64   `json:"price,omitempty"`
+	TriggerPrice              float64   `json:"trigger_price,omitempty"`
+	StopLossPrice             float64   `json:"stop_loss_price,omitempty"`
+	TakeProfitPrice           float64   `json:"take_profit_price,omitempty"`
+	SetStopLossPrice          float64   `json:"set_stop_loss,omitempty"`
+	SetTakeProfitPrice        float64   `json:"set_take_profit,omitempty"`
+	NominalUSDT               float64   `json:"nominal_usdt,omitempty"`
+	MarginAmount              float64   `json:"margin_amount,omitempty"`
+	ScaleOutFirst             float64   `json:"scale_out_1st,omitempty"`
+	ScaleOutFirstPct          float64   `json:"scale_out_1st_pct,omitempty"`
+	PartialTakeProfitOneRatio float64   `json:"partial_take_profit_1_ratio,omitempty"`
+	FinalTakeProfit           float64   `json:"final_take_profit,omitempty"`
+	Side                      string    `json:"side,omitempty"`
+	Comment                   string    `json:"comment,omitempty"`
+	ReasonAlt                 string    `json:"reason,omitempty"`
+	PositionTag               string    `json:"position,omitempty"`
+	PartialTakeProfitOne      float64   `json:"partial_take_profit_1,omitempty"`
+	PartialTakeProfitOnePct   float64   `json:"partial_take_profit_1_percent,omitempty"`
+	BreakEvenTrigger          float64   `json:"break_even_trigger,omitempty"`
+	MarginUsageCurrent        float64   `json:"margin_usage_current,omitempty"`
+	MarginUsageTarget         float64   `json:"margin_usage_target,omitempty"`
+	OpenPriceRange            []float64 `json:"open_price_range,omitempty"`
 }
 
 // FullDecision AI的完整决策（包含思维链）
@@ -123,6 +155,9 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 }
 
 // GetFullDecisionWithCustomPrompt 获取AI的完整交易决策（支持自定义prompt和模板选择）
+
+const maxAIJSONRetries = 2
+
 func GetFullDecisionWithCustomPrompt(ctx *Context, mcpClient *mcp.Client, customPrompt string, overrideBase bool, templateName string) (*FullDecision, error) {
 	// 1. 为所有币种获取市场数据
 	if err := fetchMarketDataForContext(ctx); err != nil {
@@ -131,24 +166,40 @@ func GetFullDecisionWithCustomPrompt(ctx *Context, mcpClient *mcp.Client, custom
 
 	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
 	systemPrompt := buildSystemPromptWithCustom(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, customPrompt, overrideBase, templateName)
-	userPrompt := buildUserPrompt(ctx)
+	baseUserPrompt := buildUserPrompt(ctx)
+	var lastErr error
 
-	// 3. 调用AI API（使用 system + user prompt）
-	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
-	if err != nil {
-		return nil, fmt.Errorf("调用AI API失败: %w", err)
+	for attempt := 1; attempt <= maxAIJSONRetries; attempt++ {
+		userPrompt := baseUserPrompt
+		if attempt > 1 {
+			userPrompt += "\n\n⚠️ 上一轮未输出有效的 JSON 决策，请严格使用 <decision> 标签 + 纯 JSON 数组（[{...}])，不要只写思维链。"
+		}
+
+		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+		if err != nil {
+			lastErr = fmt.Errorf("调用AI API失败: %w", err)
+			continue
+		}
+
+		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+		if err != nil {
+			lastErr = fmt.Errorf("解析AI响应失败: %w", err)
+			continue
+		}
+
+		if isFallbackWaitDecision(decision.Decisions) {
+			lastErr = fmt.Errorf("AI未输出结构化JSON决策")
+			log.Printf("⚠️ AI 输出缺少 JSON (attempt %d/%d)，准备重试", attempt, maxAIJSONRetries)
+			continue
+		}
+
+		decision.Timestamp = time.Now()
+		decision.SystemPrompt = systemPrompt
+		decision.UserPrompt = userPrompt
+		return decision, nil
 	}
 
-	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
-	if err != nil {
-		return decision, fmt.Errorf("解析AI响应失败: %w", err)
-	}
-
-	decision.Timestamp = time.Now()
-	decision.SystemPrompt = systemPrompt // 保存系统prompt
-	decision.UserPrompt = userPrompt     // 保存输入prompt
-	return decision, nil
+	return nil, fmt.Errorf("AI多次输出无效决策: %w", lastErr)
 }
 
 // fetchMarketDataForContext 为上下文中的所有币种获取市场数据和OI数据
@@ -487,8 +538,10 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("提取决策失败: %w", err)
 	}
 
-	// 3. 验证决策
+	// 3. 兼容并修正不同schema的输出，然后验证
+	decisions = normalizeDecisionFields(decisions, accountEquity)
 	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		logDecisionValidationFailure(decisions, aiResponse, err)
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -649,7 +702,7 @@ func validateJSONFormat(jsonStr string) error {
 	}
 
 	// 检查是否包含范围符号 ~（LLM 常见错误）
-	if strings.Contains(jsonStr, "~") {
+	if containsRangeSymbolOutsideString(jsonStr) {
 		return fmt.Errorf("JSON 中不可包含范围符号 ~，所有数字必须是精确的单一值")
 	}
 
@@ -849,4 +902,328 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	}
 
 	return nil
+}
+
+func isFallbackWaitDecision(decisions []Decision) bool {
+	if len(decisions) != 1 {
+		return false
+	}
+	d := decisions[0]
+	if !strings.EqualFold(d.Action, "wait") {
+		return false
+	}
+	if !strings.EqualFold(d.Symbol, "ALL") {
+		return false
+	}
+	return strings.Contains(d.Reasoning, "模型未输出结构化JSON决策")
+}
+
+func logDecisionValidationFailure(decisions []Decision, aiResponse string, validateErr error) {
+	log.Printf("❌ 决策验证失败: %v", validateErr)
+
+	if len(decisions) > 0 {
+		if data, err := json.MarshalIndent(decisions, "", "  "); err == nil {
+			log.Printf("🧾 AI决策JSON内容:\n%s", data)
+		} else {
+			log.Printf("⚠️  无法序列化AI决策JSON: %v", err)
+		}
+	} else {
+		log.Printf("⚠️  AI输出未包含任何决策")
+	}
+
+	log.Printf("🧠 AI原始响应(截断):\n%s", truncateString(aiResponse, 4000))
+}
+
+func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "...(truncated)"
+}
+
+func normalizeDecisionFields(decisions []Decision, accountEquity float64) []Decision {
+	normalized := make([]Decision, 0, len(decisions))
+	for _, d := range decisions {
+		lowerAction := strings.ToLower(strings.TrimSpace(d.Action))
+
+		if d.Percentage <= 0 && d.PercentAlias > 0 {
+			d.Percentage = d.PercentAlias
+		}
+
+		switch lowerAction {
+		case "":
+			if strings.TrimSpace(d.ReasonAlt) != "" || strings.TrimSpace(d.Reasoning) != "" {
+				d.Action = "wait"
+			}
+		case "open_limit":
+			if strings.EqualFold(d.Side, "sell") {
+				d.Action = "open_short"
+			} else {
+				d.Action = "open_long"
+			}
+		case "open_market":
+			if strings.EqualFold(d.Side, "sell") {
+				d.Action = "open_short"
+			} else {
+				d.Action = "open_long"
+			}
+		case "set_stop_loss":
+			d.Action = "update_stop_loss"
+		case "set_take_profit":
+			d.Action = "update_take_profit"
+		case "close_position", "closepos", "close_positions":
+			if strings.EqualFold(d.Side, "sell") || strings.EqualFold(d.Side, "short") ||
+				strings.Contains(strings.ToLower(d.Comment), "short") {
+				d.Action = "close_short"
+			} else {
+				d.Action = "close_long"
+			}
+		case "reduce", "reduce_position", "partial_reduce", "scale_out", "close_position_partial":
+			d.Action = "partial_close"
+		case "set_stop", "set_stoploss":
+			d.Action = "update_stop_loss"
+		case "wait":
+			d.Action = "wait"
+		case "set_position", "hold_position", "maintain_position":
+			d.Action = "hold"
+		}
+
+		if d.Reasoning == "" && d.Comment != "" {
+			d.Reasoning = d.Comment
+		}
+		if d.AmountType == "" && d.Percentage > 0 {
+			d.AmountType = "percent"
+			d.AmountValue = d.Percentage
+		}
+
+		switch d.Action {
+		case "open_long", "open_short":
+			normalizeOpenDecision(&d, accountEquity)
+		case "update_stop_loss":
+			if d.NewStopLoss <= 0 {
+				if d.StopLossPrice > 0 {
+					d.NewStopLoss = d.StopLossPrice
+				} else if d.SetStopLossPrice > 0 {
+					d.NewStopLoss = d.SetStopLossPrice
+				} else if d.Price > 0 {
+					d.NewStopLoss = d.Price
+				}
+			}
+		case "update_take_profit":
+			if d.NewTakeProfit <= 0 {
+				if d.TakeProfitPrice > 0 {
+					d.NewTakeProfit = d.TakeProfitPrice
+				} else if d.SetTakeProfitPrice > 0 {
+					d.NewTakeProfit = d.SetTakeProfitPrice
+				} else if d.ScaleOutFirst > 0 {
+					d.NewTakeProfit = d.ScaleOutFirst
+				} else if d.Price > 0 {
+					d.NewTakeProfit = d.Price
+				}
+			}
+		case "close_long", "close_short":
+			if d.Percentage > 0 && d.Percentage < 100 {
+				d.ClosePercentage = d.Percentage
+				d.Action = "partial_close"
+			}
+		case "partial_close":
+			ensureClosePercentage(&d)
+		}
+
+		normalized = append(normalized, d)
+	}
+	return normalized
+}
+
+func normalizeOpenDecision(d *Decision, accountEquity float64) {
+	// entry price (用于推导止盈等)
+	entryPrice := d.EntryPrice
+	if entryPrice <= 0 {
+		entryPrice = d.LimitPrice
+	}
+	if entryPrice <= 0 {
+		entryPrice = d.OpenPrice
+	}
+	if entryPrice <= 0 && len(d.OpenPriceRange) > 0 {
+		if len(d.OpenPriceRange) == 1 {
+			entryPrice = d.OpenPriceRange[0]
+		} else {
+			entryPrice = averageRange(d.OpenPriceRange)
+		}
+	}
+	if entryPrice <= 0 {
+		entryPrice = d.TriggerPrice
+	}
+	if entryPrice <= 0 {
+		entryPrice = d.Price
+	}
+
+	// position size
+	if d.PositionSizeUSD <= 0 {
+		if d.MarginAmount > 0 {
+			lev := d.Leverage
+			if lev <= 0 {
+				lev = 1
+			}
+			d.PositionSizeUSD = d.MarginAmount * float64(lev)
+		}
+		if d.NominalUSDT > 0 {
+			d.PositionSizeUSD = d.NominalUSDT
+		}
+		if d.PositionSizeUSD <= 0 && d.Quantity > 0 && entryPrice > 0 {
+			d.PositionSizeUSD = d.Quantity * entryPrice
+		} else {
+			leverage := d.Leverage
+			if leverage <= 0 {
+				leverage = 1
+			}
+			switch strings.ToLower(d.AmountType) {
+			case "percent":
+				d.PositionSizeUSD = accountEquity * (d.AmountValue / 100.0) * float64(leverage)
+			case "usd", "margin":
+				d.PositionSizeUSD = d.AmountValue * float64(leverage)
+			case "notional":
+				d.PositionSizeUSD = d.AmountValue
+			}
+			if d.PositionSizeUSD <= 0 && d.AmountValue > 0 {
+				d.PositionSizeUSD = d.AmountValue
+			}
+		}
+	}
+	if d.PositionSizeUSD > 0 {
+		minPosition := util.GetSafeMinPositionUSD(strings.ToUpper(d.Symbol))
+		if minPosition > 0 && d.PositionSizeUSD < minPosition {
+			d.PositionSizeUSD = minPosition
+		}
+		maxPosition := accountEquity * 10
+		if strings.EqualFold(d.Symbol, "BTCUSDT") || strings.EqualFold(d.Symbol, "ETHUSDT") {
+			maxPosition = accountEquity * 10
+		}
+		if d.PositionSizeUSD > maxPosition {
+			d.PositionSizeUSD = maxPosition
+		}
+	}
+
+	// stop loss
+	if d.StopLoss <= 0 {
+		if d.StopLossPrice > 0 {
+			d.StopLoss = d.StopLossPrice
+		} else if d.SetStopLossPrice > 0 {
+			d.StopLoss = d.SetStopLossPrice
+		} else if entryPrice > 0 {
+			offset := entryPrice * 0.004 // 默认0.4%缓冲
+			if d.Action == "open_long" {
+				d.StopLoss = entryPrice - offset
+			} else {
+				d.StopLoss = entryPrice + offset
+			}
+		}
+	}
+
+	// take profit
+	if d.TakeProfit <= 0 {
+		if d.TakeProfitPrice > 0 {
+			d.TakeProfit = d.TakeProfitPrice
+		} else if d.SetTakeProfitPrice > 0 {
+			d.TakeProfit = d.SetTakeProfitPrice
+		} else if d.ScaleOutFirst > 0 {
+			d.TakeProfit = d.ScaleOutFirst
+		} else if d.PartialTakeProfitOne > 0 {
+			d.TakeProfit = d.PartialTakeProfitOne
+		} else if d.FinalTakeProfit > 0 {
+			d.TakeProfit = d.FinalTakeProfit
+		} else if entryPrice > 0 && d.StopLoss > 0 {
+			diff := math.Abs(entryPrice - d.StopLoss)
+			if diff > 0 {
+				if d.Action == "open_long" {
+					d.TakeProfit = entryPrice + diff*3
+				} else {
+					d.TakeProfit = entryPrice - diff*3
+				}
+			}
+		}
+	}
+
+	// risk usd estimation if missing
+	if d.RiskUSD <= 0 && d.StopLoss > 0 && entryPrice > 0 && d.PositionSizeUSD > 0 && d.Leverage > 0 {
+		margin := d.PositionSizeUSD / float64(d.Leverage)
+		priceDiffPct := math.Abs(entryPrice-d.StopLoss) / entryPrice
+		d.RiskUSD = margin * priceDiffPct
+	}
+
+	if d.Reasoning == "" && d.ReasonAlt != "" {
+		d.Reasoning = d.ReasonAlt
+	}
+}
+
+func averageRange(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sum := 0.0
+	count := 0
+	for _, v := range values {
+		if v == 0 {
+			continue
+		}
+		sum += v
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+func ensureClosePercentage(d *Decision) {
+	if d.ClosePercentage <= 0 {
+		switch strings.ToLower(d.AmountType) {
+		case "percent", "percentage":
+			if d.AmountValue > 0 {
+				d.ClosePercentage = d.AmountValue
+			}
+		}
+	}
+	if d.ClosePercentage <= 0 && d.Percentage > 0 {
+		d.ClosePercentage = d.Percentage
+	}
+	if d.ClosePercentage <= 0 && d.PartialTakeProfitOnePct > 0 {
+		d.ClosePercentage = d.PartialTakeProfitOnePct
+	}
+	if d.ClosePercentage <= 0 && d.PartialTakeProfitOneRatio > 0 {
+		d.ClosePercentage = d.PartialTakeProfitOneRatio * 100
+	}
+	if d.ClosePercentage <= 0 {
+		d.ClosePercentage = 100
+	}
+	if d.ClosePercentage > 100 {
+		d.ClosePercentage = 100
+	}
+}
+
+func containsRangeSymbolOutsideString(s string) bool {
+	inString := false
+	escape := false
+	for _, r := range s {
+		if escape {
+			escape = false
+			continue
+		}
+		if r == '\\' && inString {
+			escape = true
+			continue
+		}
+		if r == '"' {
+			inString = !inString
+			continue
+		}
+		if r == '~' && !inString {
+			return true
+		}
+	}
+	return false
 }
