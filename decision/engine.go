@@ -762,10 +762,11 @@ func validateDecisions(decisions []Decision, accountEquity float64, btcEthLevera
 			key := fmt.Sprintf("%s_%s", d.Symbol, direction)
 			currentCount := positionCounts[key]
 
-			// ⚠️ 禁止同向累积超过2次
-			if currentCount >= 2 {
-				return fmt.Errorf("决策 #%d 违反累积仓位限制: %s 已有 %d 个%s仓位，禁止第3次加仓（风控规则：同向最多2个仓位）",
-					i+1, d.Symbol, currentCount, direction)
+			// ⚠️ 币安持仓是累加模式：禁止对已有持仓继续加仓
+			// 如果已经有持仓(currentCount > 0),说明之前已经开过仓,禁止再次开同向仓
+			if currentCount > 0 {
+				return fmt.Errorf("决策 #%d 违反累积仓位限制: %s 已有%s持仓，禁止继续加仓（风控规则：币安持仓为累加模式，禁止对同一持仓重复开仓）",
+					i+1, d.Symbol, direction)
 			}
 
 			// ⚠️ 禁止多空对冲：检查是否存在反向仓位
@@ -775,8 +776,8 @@ func validateDecisions(decisions []Decision, accountEquity float64, btcEthLevera
 			}
 			oppositeKey := fmt.Sprintf("%s_%s", d.Symbol, oppositeDirection)
 			if positionCounts[oppositeKey] > 0 {
-				return fmt.Errorf("决策 #%d 违反多空对冲禁止规则: %s 已有 %d 个%s仓位，禁止开%s仓（必须先平掉反向仓位）",
-					i+1, d.Symbol, positionCounts[oppositeKey], oppositeDirection, direction)
+				return fmt.Errorf("决策 #%d 违反多空对冲禁止规则: %s 已有%s持仓，禁止开%s仓（必须先平掉反向仓位）",
+					i+1, d.Symbol, oppositeDirection, direction)
 			}
 
 			// 如果这个决策通过检查，将它加入到计数中（用于检查后续决策）
