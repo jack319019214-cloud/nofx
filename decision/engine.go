@@ -811,20 +811,19 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		minPositionSize := util.GetSafeMinPositionUSD(d.Symbol)
 		symbolUpper := strings.ToUpper(d.Symbol)
 		if d.PositionSizeUSD < minPositionSize {
-			if symbolUpper == "BTCUSDT" || symbolUpper == "ETHUSDT" {
-				return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（因价格高且精度限制，避免数量四舍五入为0）", symbolUpper, d.PositionSizeUSD, minPositionSize)
-			}
-			return fmt.Errorf("%s 开仓金额过小(%.2f USDT)，必须≥%.2f USDT（Binance 最小名义价值要求）", symbolUpper, d.PositionSizeUSD, minPositionSize)
+			// 自动修正到最小值，而不是拒绝
+			oldSize := d.PositionSizeUSD
+			d.PositionSizeUSD = minPositionSize
+			log.Printf("⚠️  自动修正仓位: %s 原始值 %.2f USDT → 修正为 %.2f USDT（最小开仓要求）", symbolUpper, oldSize, minPositionSize)
 		}
 
 		// 验证仓位价值上限（加1%容差以避免浮点数精度问题）
 		tolerance := maxPositionValue * 0.01 // 1%容差
 		if d.PositionSizeUSD > maxPositionValue+tolerance {
-			if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-				return fmt.Errorf("BTC/ETH单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
-			} else {
-				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
-			}
+			// 自动修正到账户净值上限，而不是拒绝
+			oldSize := d.PositionSizeUSD
+			d.PositionSizeUSD = maxPositionValue
+			log.Printf("⚠️  自动修正仓位: %s 原始值 %.2f USDT → 修正为 %.2f USDT（账户净值上限=%.2f×10）", symbolUpper, oldSize, maxPositionValue, accountEquity)
 		}
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
 			return fmt.Errorf("止损和止盈必须大于0")
