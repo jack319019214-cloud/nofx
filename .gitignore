@@ -11,6 +11,10 @@ nofx-auto
 *.exe
 nofx
 nofx_test
+close_positions
+hash-password
+scripts/*/main
+scripts/*/*/main
 
 # Go 相关
 *.test
