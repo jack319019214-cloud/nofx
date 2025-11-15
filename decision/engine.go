@@ -181,7 +181,7 @@ func GetFullDecisionWithCustomPrompt(ctx *Context, mcpClient *mcp.Client, custom
 			continue
 		}
 
-		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Positions)
 		if err != nil {
 			lastErr = fmt.Errorf("解析AI响应失败: %w", err)
 			continue
@@ -525,7 +525,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, positions []PositionInfo) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -540,7 +540,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 
 	// 3. 兼容并修正不同schema的输出，然后验证
 	decisions = normalizeDecisionFields(decisions, accountEquity)
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, positions); err != nil {
 		logDecisionValidationFailure(decisions, aiResponse, err)
 		return &FullDecision{
 			CoTTrace:  cotTrace,
@@ -740,9 +740,51 @@ func compactArrayOpen(s string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, positions []PositionInfo) error {
+	// ⚠️ 累积仓位检查：统计当前持仓中每个标的每个方向的数量
+	positionCounts := make(map[string]int) // key: "BTCUSDT_long" or "BTCUSDT_short"
+
+	for _, pos := range positions {
+		key := fmt.Sprintf("%s_%s", pos.Symbol, pos.Side)
+		positionCounts[key]++
+	}
+
+	// 检查每个开仓决策
 	for i := range decisions {
-		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		d := &decisions[i]
+
+		// 只检查开仓操作
+		if d.Action == "open_long" || d.Action == "open_short" {
+			direction := "long"
+			if d.Action == "open_short" {
+				direction = "short"
+			}
+			key := fmt.Sprintf("%s_%s", d.Symbol, direction)
+			currentCount := positionCounts[key]
+
+			// ⚠️ 禁止同向累积超过2次
+			if currentCount >= 2 {
+				return fmt.Errorf("决策 #%d 违反累积仓位限制: %s 已有 %d 个%s仓位，禁止第3次加仓（风控规则：同向最多2个仓位）",
+					i+1, d.Symbol, currentCount, direction)
+			}
+
+			// ⚠️ 禁止多空对冲：检查是否存在反向仓位
+			oppositeDirection := "short"
+			if direction == "short" {
+				oppositeDirection = "long"
+			}
+			oppositeKey := fmt.Sprintf("%s_%s", d.Symbol, oppositeDirection)
+			if positionCounts[oppositeKey] > 0 {
+				return fmt.Errorf("决策 #%d 违反多空对冲禁止规则: %s 已有 %d 个%s仓位，禁止开%s仓（必须先平掉反向仓位）",
+					i+1, d.Symbol, positionCounts[oppositeKey], oppositeDirection, direction)
+			}
+
+			// 如果这个决策通过检查，将它加入到计数中（用于检查后续决策）
+			positionCounts[key]++
+		}
+
+		// 验证单个决策的其他规则
+		if err := validateDecision(d, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
