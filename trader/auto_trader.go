@@ -113,6 +113,19 @@ type AutoTrader struct {
 	database              interface{}        // 数据库引用（用于自动更新余额）
 	userID                string             // 用户ID
 	cycleReservedMargin   float64            // 当前决策循环内已预留的保证金
+
+	// 市场数据新鲜度检查
+	marketDataHistory []MarketDataSnapshot // 最近3个周期的市场数据
+	marketDataMutex   sync.RWMutex         // 市场数据读写锁
+}
+
+// MarketDataSnapshot 市场数据快照（用于新鲜度检查）
+type MarketDataSnapshot struct {
+	Timestamp time.Time
+	Price     float64
+	RSI7      float64
+	MACD      float64
+	Symbol    string
 }
 
 var errDecisionSkipped = errors.New("decision skipped by guard")
@@ -505,6 +518,30 @@ func (at *AutoTrader) runCycle() error {
 			return err
 		}
 		return nil
+	}
+
+	// 4.5 检查市场数据新鲜度（对比最近3个周期，防止基于陈旧数据交易）
+	if len(ctx.CandidateCoins) > 0 {
+		// 取第一个候选币种的数据进行检查（BTC 100x通常只有一个币种）
+		coin := ctx.CandidateCoins[0]
+		if marketData, ok := ctx.MarketDataMap[coin.Symbol]; ok && marketData != nil {
+			fresh, alertMsg := at.checkMarketDataFreshness(
+				coin.Symbol,
+				marketData.CurrentPrice,
+				marketData.CurrentRSI7,
+				marketData.CurrentMACD,
+			)
+			if !fresh {
+				log.Println(alertMsg)
+				record.Success = false
+				record.ErrorMessage = alertMsg
+				at.decisionLogger.LogDecision(record)
+				at.lastCycleEquity = ctx.Account.TotalEquity
+				return fmt.Errorf("%s", alertMsg)
+			}
+		} else {
+			log.Printf("⚠️ 未找到 %s 的市场数据，跳过新鲜度检查", coin.Symbol)
+		}
 	}
 
 	// 5. 调用AI获取完整决策
@@ -974,6 +1011,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 	at.cycleReservedMargin += totalRequired
 
+	// ⚠️ 清除持仓缓存，确保下次决策能看到最新持仓
+	at.trader.ClearPositionsCache()
+
 	// 记录开仓时间
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -1106,6 +1146,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
 	at.cycleReservedMargin += totalRequired
+
+	// ⚠️ 清除持仓缓存，确保下次决策能看到最新持仓
+	at.trader.ClearPositionsCache()
 
 	// 记录开仓时间
 	posKey := decision.Symbol + "_short"
@@ -1712,50 +1755,7 @@ func (at *AutoTrader) executeAutoPartialClose(ctx *decision.Context, record *log
 }
 
 func (at *AutoTrader) shouldBlockLong(symbol string, data *market.Data) (bool, string) {
-	if data == nil {
-		return false, ""
-	}
-
-	// ✅ 极度超卖例外：允许反弹交易
-	// 优化版：降低门槛，在较温和的超卖时也允许小仓位试单
-	// 条件1：RSI7 < 25 且 1h跌幅 < -0.5%（放宽条件）
-	// 条件2：RSI7 < 20（极度超卖，即使跌幅小也允许）
-	if data.CurrentRSI7 > 0 && ((data.CurrentRSI7 < 25 && data.PriceChange1h < -0.5) || data.CurrentRSI7 < 20) {
-		// 极度超卖，允许做多反弹，但需要 AI 自己判断风险
-		return false, ""
-	}
-
-	ltc := data.LongerTermContext
-	emaBear := false
-	macdBear := false
-	rsiBear := false
-	if ltc != nil {
-		if ltc.EMA20 > 0 && ltc.EMA50 > 0 && ltc.EMA20 < ltc.EMA50 {
-			emaBear = true
-		}
-		if len(ltc.MACDValues) > 0 && ltc.MACDValues[len(ltc.MACDValues)-1] < 0 {
-			macdBear = true
-		}
-		if len(ltc.RSI14Values) > 0 && ltc.RSI14Values[len(ltc.RSI14Values)-1] < 45 {
-			rsiBear = true
-		}
-	}
-
-	priceDown := data.PriceChange1h <= -0.2 && data.PriceChange4h <= -0.5
-
-	if (emaBear && macdBear) || (macdBear && rsiBear) || (emaBear && priceDown) || (rsiBear && priceDown) {
-		var macdVal, rsiVal float64
-		if ltc != nil && len(ltc.MACDValues) > 0 {
-			macdVal = ltc.MACDValues[len(ltc.MACDValues)-1]
-		}
-		if ltc != nil && len(ltc.RSI14Values) > 0 {
-			rsiVal = ltc.RSI14Values[len(ltc.RSI14Values)-1]
-		}
-		reason := fmt.Sprintf("4h趋势向下：EMA20 %.0f < EMA50 %.0f, MACD %.1f, RSI14 %.1f, 1h %.2f%% / 4h %.2f%%",
-			ltc.EMA20, ltc.EMA50, macdVal, rsiVal, data.PriceChange1h, data.PriceChange4h)
-		return true, reason
-	}
-
+	// ⚠️ 临时禁用过滤器 - 让AI prompt完全自主决策
 	return false, ""
 }
 
@@ -1897,10 +1897,12 @@ func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
 	for _, pos := range positions {
 		symbol, _ := pos["symbol"].(string)
 		side, _ := pos["side"].(string)
-		quantity := getMapFloat(pos, "quantity")
-
-		if symbol == "" || quantity <= 0 {
+		quantity := extractPositionQuantity(pos)
+		if symbol == "" {
 			continue
+		}
+		if quantity <= 0 {
+			log.Printf("⚠️ [%s] 未能读取 %s 的持仓数量，回退为交易所实时查询", at.name, symbol)
 		}
 
 		if err := at.trader.CancelStopOrders(symbol); err != nil {
@@ -1909,11 +1911,11 @@ func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
 
 		switch strings.ToLower(side) {
 		case "long":
-			if _, err := at.trader.CloseLong(symbol, 0); err != nil {
+			if _, err := at.trader.CloseLong(symbol, quantity); err != nil {
 				return closed, fmt.Errorf("平多仓 %s 失败: %w", symbol, err)
 			}
 		case "short":
-			if _, err := at.trader.CloseShort(symbol, 0); err != nil {
+			if _, err := at.trader.CloseShort(symbol, quantity); err != nil {
 				return closed, fmt.Errorf("平空仓 %s 失败: %w", symbol, err)
 			}
 		default:
@@ -1950,6 +1952,28 @@ func getMapFloat(data map[string]interface{}, key string) float64 {
 			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
 				return parsed
 			}
+		}
+	}
+	return 0
+}
+
+// extractPositionQuantity 兼容不同交易所的持仓数量字段
+func extractPositionQuantity(pos map[string]interface{}) float64 {
+	keys := []string{
+		"quantity",
+		"qty",
+		"positionAmt",
+		"position_amt",
+		"size",
+		"amount",
+	}
+
+	for _, key := range keys {
+		if qty := getMapFloat(pos, key); qty != 0 {
+			if qty < 0 {
+				return -qty
+			}
+			return qty
 		}
 	}
 	return 0
@@ -2381,4 +2405,65 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol string) {
 	defer at.peakPnLCacheMutex.Unlock()
 
 	delete(at.peakPnLCache, symbol)
+}
+
+// checkMarketDataFreshness 检查市场数据新鲜度（对比最近3个周期）
+// 返回: (是否通过检查, 错误描述)
+func (at *AutoTrader) checkMarketDataFreshness(symbol string, price, rsi7, macd float64) (bool, string) {
+	at.marketDataMutex.Lock()
+	defer at.marketDataMutex.Unlock()
+
+	// 创建当前快照
+	current := MarketDataSnapshot{
+		Timestamp: time.Now(),
+		Price:     price,
+		RSI7:      rsi7,
+		MACD:      macd,
+		Symbol:    symbol,
+	}
+
+	// 如果历史记录少于2个，直接添加并通过
+	if len(at.marketDataHistory) < 2 {
+		at.marketDataHistory = append(at.marketDataHistory, current)
+		return true, ""
+	}
+
+	// 检查最近2个周期的数据是否与当前数据完全相同
+	// 允许微小的浮点数误差（0.01%）
+	priceThreshold := 0.0001 // 0.01%
+	rsi7Threshold := 0.01    // RSI允许0.01的误差
+	macdThreshold := 0.01    // MACD允许0.01的误差
+
+	staleCycles := 0
+	for i := len(at.marketDataHistory) - 1; i >= 0 && i >= len(at.marketDataHistory)-2; i-- {
+		hist := at.marketDataHistory[i]
+		if hist.Symbol != symbol {
+			continue
+		}
+
+		priceDiff := math.Abs(hist.Price-current.Price) / current.Price
+		rsi7Diff := math.Abs(hist.RSI7 - current.RSI7)
+		macdDiff := math.Abs(hist.MACD - current.MACD)
+
+		if priceDiff < priceThreshold && rsi7Diff < rsi7Threshold && macdDiff < macdThreshold {
+			staleCycles++
+		}
+	}
+
+	// 如果连续2个周期数据完全相同，判定为陈旧数据
+	if staleCycles >= 2 {
+		timeSinceFirst := current.Timestamp.Sub(at.marketDataHistory[len(at.marketDataHistory)-2].Timestamp)
+		return false, fmt.Sprintf("⚠️ 市场数据陈旧告警: %s 价格%.2f/RSI%.2f/MACD%.2f 已连续%d个周期未变化（持续%.0f秒）",
+			symbol, current.Price, current.RSI7, current.MACD, staleCycles+1, timeSinceFirst.Seconds())
+	}
+
+	// 添加当前数据到历史记录
+	at.marketDataHistory = append(at.marketDataHistory, current)
+
+	// 只保留最近3个周期的数据
+	if len(at.marketDataHistory) > 3 {
+		at.marketDataHistory = at.marketDataHistory[len(at.marketDataHistory)-3:]
+	}
+
+	return true, ""
 }
