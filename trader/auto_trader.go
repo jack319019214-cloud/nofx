@@ -92,6 +92,7 @@ type AutoTrader struct {
 	decisionLogger        *logger.DecisionLogger // 决策日志记录器
 	initialBalance        float64
 	dailyPnL              float64
+	dailyStartEquity      float64
 	customPrompt          string   // 自定义交易策略prompt
 	overrideBasePrompt    bool     // 是否覆盖基础prompt
 	systemPromptTemplate  string   // 系统提示词模板名称
@@ -129,11 +130,6 @@ type MarketDataSnapshot struct {
 }
 
 var errDecisionSkipped = errors.New("decision skipped by guard")
-
-const (
-	timeStopHardLimit = 45 * time.Minute
-	timeStopSoftLimit = 30 * time.Minute
-)
 
 // NewAutoTrader 创建自动交易器
 func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string) (*AutoTrader, error) {
@@ -437,6 +433,7 @@ func (at *AutoTrader) runCycle() error {
 	// 2. 重置日盈亏（每天重置）
 	if time.Since(at.lastResetTime) > 24*time.Hour {
 		at.dailyPnL = 0
+		at.dailyStartEquity = 0
 		at.lastResetTime = time.Now()
 		log.Println("📅 日盈亏已重置")
 	}
@@ -494,29 +491,13 @@ func (at *AutoTrader) runCycle() error {
 		}
 	}
 
-	if ratio, reason := at.evaluateRiskTriggers(ctx, equityDropPct, false); ratio > 0 {
-		if autoErr := at.executeAutoPartialClose(ctx, record, ratio, reason); autoErr != nil {
-			record.Success = false
-			record.ErrorMessage = fmt.Sprintf("自动减仓失败: %v", autoErr)
-			at.decisionLogger.LogDecision(record)
-			at.lastCycleEquity = ctx.Account.TotalEquity
-			return autoErr
-		}
-		at.decisionLogger.LogDecision(record)
-		at.lastCycleEquity = ctx.Account.TotalEquity
-		return nil
+	if at.dailyStartEquity == 0 {
+		at.dailyStartEquity = ctx.Account.TotalEquity
 	}
+	at.dailyPnL = ctx.Account.TotalEquity - at.dailyStartEquity
 
-	if acted, err := at.enforceTimeStop(ctx, record); acted {
-		if err != nil {
-			record.Success = false
-			record.ErrorMessage = fmt.Sprintf("时间止损失败: %v", err)
-		}
-		at.decisionLogger.LogDecision(record)
-		at.lastCycleEquity = ctx.Account.TotalEquity
-		if err != nil {
-			return err
-		}
+	if reason := at.evaluatePromptRiskLimits(ctx, equityDropPct); reason != "" {
+		at.triggerPromptRiskPause(record, reason, ctx.Account.TotalEquity)
 		return nil
 	}
 
@@ -562,12 +543,6 @@ func (at *AutoTrader) runCycle() error {
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v", err)
-
-		if ratio, reason := at.evaluateRiskTriggers(ctx, equityDropPct, true); ratio > 0 {
-			if autoErr := at.executeAutoPartialClose(ctx, record, ratio, reason); autoErr != nil {
-				record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("自动减仓失败: %v", autoErr))
-			}
-		}
 
 		// 打印系统提示词和AI思维链（即使有错误，也要输出以便调试）
 		if decision != nil {
@@ -1640,118 +1615,50 @@ func (at *AutoTrader) minExecutableQuantity(symbol string, price float64) (float
 	return minQuantity, step, minNotional
 }
 
-func (at *AutoTrader) evaluateRiskTriggers(ctx *decision.Context, equityDropPct float64, onFailure bool) (float64, string) {
-	if ctx == nil || len(ctx.Positions) == 0 {
-		return 0, ""
+func (at *AutoTrader) evaluatePromptRiskLimits(ctx *decision.Context, equityDropPct float64) string {
+	if ctx == nil {
+		return ""
 	}
 
-	margin := ctx.Account.MarginUsedPct
-	if margin >= 80 {
-		return 0.5, fmt.Sprintf("保证金利用率 %.1f%% 超过 80%%", margin)
+	account := ctx.Account
+	if account.AvailableBalance > 0 && account.AvailableBalance < 10 {
+		return fmt.Sprintf("可用余额 %.2f USDT 低于 10 USDT 风险下限", account.AvailableBalance)
 	}
 
-	if equityDropPct >= 5 {
-		return 0.3, fmt.Sprintf("净值较上一周期下降 %.2f%%", equityDropPct)
+	if account.MarginUsedPct > 65 {
+		return fmt.Sprintf("保证金使用率 %.1f%% 超出 65%% 上限", account.MarginUsedPct)
 	}
 
-	for _, pos := range ctx.Positions {
-		if pos.UnrealizedPnLPct <= -1.2 || margin >= 70 {
-			return 0.3, fmt.Sprintf("浮亏 %.2f%% / 占用 %.1f%% 触发自动减仓", pos.UnrealizedPnLPct, margin)
+	if equityDropPct >= 3 {
+		return fmt.Sprintf("单周期净值下跌 %.2f%%，需休息复盘", equityDropPct)
+	}
+
+	if at.dailyStartEquity > 0 {
+		lossLimit := math.Min(at.dailyStartEquity*0.02, 2)
+		if lossLimit > 0 && at.dailyPnL <= -lossLimit {
+			return fmt.Sprintf("当日亏损 %.2f USDT 超过上限 %.2f USDT", -at.dailyPnL, lossLimit)
 		}
 	}
 
-	if onFailure {
-		return 0.25, "AI 决策失败，触发安全减仓"
-	}
-
-	return 0, ""
+	return ""
 }
 
-func (at *AutoTrader) enforceTimeStop(ctx *decision.Context, record *logger.DecisionRecord) (bool, error) {
-	if ctx == nil || len(ctx.Positions) == 0 {
-		return false, nil
+func (at *AutoTrader) triggerPromptRiskPause(record *logger.DecisionRecord, reason string, currentEquity float64) {
+	pause := at.config.StopTradingTime
+	if pause <= 0 {
+		pause = 15 * time.Minute
 	}
+	at.stopUntil = time.Now().Add(pause)
 
-	now := time.Now()
-	triggered := false
-
-	for _, pos := range ctx.Positions {
-		if pos.UpdateTime == 0 {
-			continue
-		}
-		heldDuration := now.Sub(time.Unix(0, pos.UpdateTime*int64(time.Millisecond)))
-		if heldDuration < timeStopSoftLimit {
-			continue
-		}
-
-		if heldDuration < timeStopHardLimit && pos.UnrealizedPnLPct > 0.6 {
-			continue
-		}
-
-		var err error
-		if strings.ToLower(pos.Side) == "short" {
-			_, err = at.trader.CloseShort(pos.Symbol, pos.Quantity)
-		} else {
-			_, err = at.trader.CloseLong(pos.Symbol, pos.Quantity)
-		}
-		if err != nil {
-			return true, err
-		}
-
-		triggered = true
-		reason := fmt.Sprintf("持仓 %.2f%% / 时长 %.0f 分钟，触发时间止损", pos.UnrealizedPnLPct, heldDuration.Minutes())
-		record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("⏱ %s %s", pos.Symbol, reason))
-		record.Decisions = append(record.Decisions, logger.DecisionAction{
-			Action:    "time_stop_close",
-			Symbol:    pos.Symbol,
-			Quantity:  pos.Quantity,
-			Leverage:  pos.Leverage,
-			Price:     pos.MarkPrice,
-			Timestamp: time.Now(),
-			Success:   true,
-		})
+	msg := fmt.Sprintf("⛔️ 风控触发：%s，暂停交易 %.0f 分钟", reason, pause.Minutes())
+	log.Println(msg)
+	if record != nil {
+		record.Success = false
+		record.ErrorMessage = reason
+		record.ExecutionLog = append(record.ExecutionLog, msg)
 	}
-
-	return triggered, nil
-}
-
-func (at *AutoTrader) executeAutoPartialClose(ctx *decision.Context, record *logger.DecisionRecord, ratio float64, reason string) error {
-	if ctx == nil || len(ctx.Positions) == 0 {
-		return fmt.Errorf("没有持仓可供减仓")
-	}
-
-	pos := ctx.Positions[0]
-	quantity := pos.Quantity * ratio
-	minQuantity := math.Max(pos.Quantity*0.1, 0.0001)
-	if quantity < minQuantity {
-		quantity = minQuantity
-	}
-	if quantity > pos.Quantity {
-		quantity = pos.Quantity
-	}
-
-	var err error
-	if strings.ToLower(pos.Side) == "short" {
-		_, err = at.trader.CloseShort(pos.Symbol, quantity)
-	} else {
-		_, err = at.trader.CloseLong(pos.Symbol, quantity)
-	}
-	if err != nil {
-		return err
-	}
-
-	record.ExecutionLog = append(record.ExecutionLog,
-		fmt.Sprintf("⚠️ 自动减仓 %.4f %s (%s)", quantity, pos.Symbol, reason))
-	record.Decisions = append(record.Decisions, logger.DecisionAction{
-		Action:    "auto_partial_close",
-		Symbol:    pos.Symbol,
-		Quantity:  quantity,
-		Leverage:  pos.Leverage,
-		Price:     pos.MarkPrice,
-		Timestamp: time.Now(),
-		Success:   true,
-	})
-	return nil
+	at.decisionLogger.LogDecision(record)
+	at.lastCycleEquity = currentEquity
 }
 
 func (at *AutoTrader) shouldBlockLong(symbol string, data *market.Data) (bool, string) {
