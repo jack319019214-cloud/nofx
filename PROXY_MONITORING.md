@@ -47,7 +47,8 @@ if consecutiveEOFCount >= 3 {
 - 检测 ss-proxy 容器运行状态
 - 分析日志中的 timeout/error 错误
 - 分析后端日志中的 EOF/API失败
-- 连续失败3次后自动重启 ss-proxy
+- 直接通过 SOCKS5 代理请求币安 `ping` 接口
+- 连续失败3次后自动重启 ss-proxy (失败计数持久化在 `/root/nofx/logs/.proxy_monitor_state`)
 
 **检查项目:**
 
@@ -172,6 +173,12 @@ tail -f /root/nofx/logs/proxy_monitor.log
 # 查找重启事件
 grep "重启" /root/nofx/logs/proxy_monitor.log
 ```
+
+### 连续失败计数状态文件
+
+- 路径: `/root/nofx/logs/.proxy_monitor_state`
+- 用途: 跨 cron 任务保存连续失败次数,确保 3 次失败后一定会被重启
+- 重置: `echo 0 > /root/nofx/logs/.proxy_monitor_state` 或在脚本一次成功检查后自动重置
 
 ## 5. 缓存降级机制
 
