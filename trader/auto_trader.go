@@ -78,6 +78,8 @@ type AutoTraderConfig struct {
 
 	// 系统提示词模板
 	SystemPromptTemplate string // 系统提示词模板名称（如 "default", "aggressive"）
+
+	FlatRelaxThreshold int // 触发空仓灵活模式的周期阈值（0=使用默认值）
 }
 
 // AutoTrader 自动交易器
@@ -101,23 +103,38 @@ type AutoTrader struct {
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
-	startTime             time.Time          // 系统启动时间
-	callCount             int                // AI调用次数
-	positionFirstSeenTime map[string]int64   // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
-	stopMonitorCh         chan struct{}      // 用于停止监控goroutine
-	monitorWg             sync.WaitGroup     // 用于等待监控goroutine结束
-	peakPnLCache          map[string]float64 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
-	peakPnLCacheMutex     sync.RWMutex       // 缓存读写锁
-	lastBalanceSyncTime   time.Time          // 上次余额同步时间
-	lastEquitySnapshot    float64            // 上次检测到的账户净值（用于识别充值/提现）
-	lastCycleEquity       float64            // 上一次AI循环的净值，用于计算环比跌幅
-	database              interface{}        // 数据库引用（用于自动更新余额）
-	userID                string             // 用户ID
-	cycleReservedMargin   float64            // 当前决策循环内已预留的保证金
+	startTime             time.Time                        // 系统启动时间
+	callCount             int                              // AI调用次数
+	positionFirstSeenTime map[string]int64                 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	stopMonitorCh         chan struct{}                    // 用于停止监控goroutine
+	monitorWg             sync.WaitGroup                   // 用于等待监控goroutine结束
+	peakPnLCache          map[string]float64               // 最高收益缓存 (symbol -> 峰值盈亏百分比)
+	peakPnLCacheMutex     sync.RWMutex                     // 缓存读写锁
+	lastBalanceSyncTime   time.Time                        // 上次余额同步时间
+	lastEquitySnapshot    float64                          // 上次检测到的账户净值（用于识别充值/提现）
+	lastCycleEquity       float64                          // 上一次AI循环的净值，用于计算环比跌幅
+	database              interface{}                      // 数据库引用（用于自动更新余额）
+	userID                string                           // 用户ID
+	cycleReservedMargin   float64                          // 当前决策循环内已预留的保证金
+	flatCycleCount        int                              // 连续空仓周期数
+	flatSince             time.Time                        // 连续空仓开始时间
+	openPositionSnapshots map[string]*openPositionSnapshot // 当前持仓的开仓快照
+	riskPauseReason       string                           // 当前风控暂停原因
 
 	// 市场数据新鲜度检查
 	marketDataHistory []MarketDataSnapshot // 最近3个周期的市场数据
 	marketDataMutex   sync.RWMutex         // 市场数据读写锁
+}
+
+type openPositionSnapshot struct {
+	EntryPrice float64
+	Quantity   float64
+	Leverage   int
+	OpenTime   time.Time
+}
+
+type tradeHistoryRecorder interface {
+	RecordTradeHistory(traderID, symbol, side string, leverage int, quantity, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed float64, openTime, closeTime time.Time, reason string) error
 }
 
 // MarketDataSnapshot 市场数据快照（用于新鲜度检查）
@@ -258,6 +275,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		lastEquitySnapshot:    config.InitialBalance,
 		database:              database,
 		userID:                userID,
+		openPositionSnapshots: make(map[string]*openPositionSnapshot),
 	}, nil
 }
 
@@ -420,16 +438,6 @@ func (at *AutoTrader) runCycle() error {
 		Success:      true,
 	}
 
-	// 1. 检查是否需要停止交易
-	if time.Now().Before(at.stopUntil) {
-		remaining := at.stopUntil.Sub(time.Now())
-		log.Printf("⏸ 风险控制：暂停交易中，剩余 %.0f 分钟", remaining.Minutes())
-		record.Success = false
-		record.ErrorMessage = fmt.Sprintf("风险控制暂停中，剩余 %.0f 分钟", remaining.Minutes())
-		at.decisionLogger.LogDecision(record)
-		return nil
-	}
-
 	// 2. 重置日盈亏（每天重置）
 	if time.Since(at.lastResetTime) > 24*time.Hour {
 		at.dailyPnL = 0
@@ -450,6 +458,18 @@ func (at *AutoTrader) runCycle() error {
 		record.ErrorMessage = fmt.Sprintf("构建交易上下文失败: %v", err)
 		at.decisionLogger.LogDecision(record)
 		return fmt.Errorf("构建交易上下文失败: %w", err)
+	}
+
+	// 允许可用余额恢复后立即解除暂停
+	if at.isRiskPauseActive(ctx) {
+		remaining := at.stopUntil.Sub(time.Now())
+		log.Printf("⏸ 风险控制：%s，剩余 %.0f 分钟", at.riskPauseReason, math.Max(remaining.Minutes(), 0))
+		record.Success = false
+		record.ErrorMessage = at.riskPauseReason
+		msg := fmt.Sprintf("风控暂停：%s，剩余 %.0f 分钟", at.riskPauseReason, math.Max(remaining.Minutes(), 0))
+		record.ExecutionLog = append(record.ExecutionLog, msg)
+		at.decisionLogger.LogDecision(record)
+		return nil
 	}
 
 	// 保存账户状态快照
@@ -759,7 +779,21 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	for key := range at.positionFirstSeenTime {
 		if !currentPositionKeys[key] {
 			delete(at.positionFirstSeenTime, key)
+			delete(at.openPositionSnapshots, key)
 		}
+	}
+
+	at.syncOpenPositionSnapshots(positionInfos)
+	at.reconcileSnapshotsWithInfos(positionInfos)
+
+	if len(positionInfos) == 0 {
+		if at.flatCycleCount == 0 {
+			at.flatSince = time.Now()
+		}
+		at.flatCycleCount++
+	} else {
+		at.flatCycleCount = 0
+		at.flatSince = time.Time{}
 	}
 
 	// 3. 获取交易员的候选币种池
@@ -810,7 +844,31 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		Performance:    performance, // 添加历史表现分析
 	}
 
+	ctx.FlatCycles = at.flatCycleCount
+	ctx.FlatRelaxThreshold = at.getFlatRelaxThreshold()
+	ctx.FlatRelaxActive = ctx.Account.PositionCount == 0 && ctx.FlatCycles >= ctx.FlatRelaxThreshold
+	if !at.flatSince.IsZero() && ctx.Account.PositionCount == 0 {
+		ctx.FlatSince = at.flatSince.Format("2006-01-02 15:04:05")
+	}
+
 	return ctx, nil
+}
+
+func (at *AutoTrader) getFlatRelaxThreshold() int {
+	if at.config.FlatRelaxThreshold > 0 {
+		return at.config.FlatRelaxThreshold
+	}
+
+	relaxDuration := 3 * time.Hour
+	interval := at.config.ScanInterval
+	if interval <= 0 {
+		interval = 3 * time.Minute
+	}
+	threshold := int(relaxDuration / interval)
+	if threshold < 30 {
+		threshold = 30
+	}
+	return threshold
 }
 
 // executeDecisionWithRecord 执行AI决策并记录详细信息
@@ -989,6 +1047,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// ⚠️ 清除持仓缓存，确保下次决策能看到最新持仓
 	at.trader.ClearPositionsCache()
 
+	at.updateOpenSnapshot(decision.Symbol, "long", marketData.CurrentPrice, quantity, decision.Leverage)
+
 	// 记录开仓时间
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -1125,6 +1185,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// ⚠️ 清除持仓缓存，确保下次决策能看到最新持仓
 	at.trader.ClearPositionsCache()
 
+	at.updateOpenSnapshot(decision.Symbol, "short", marketData.CurrentPrice, quantity, decision.Leverage)
+
 	// 记录开仓时间
 	posKey := decision.Symbol + "_short"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -1152,6 +1214,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
+	at.ensureSnapshotFromExchange(decision.Symbol, "long")
 	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
 		return err
@@ -1163,6 +1226,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	at.recordRealizedTrade(decision.Symbol, "long", 0, actionRecord.Price, decision.Reasoning, true)
 	return nil
 }
 
@@ -1178,6 +1242,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	actionRecord.Price = marketData.CurrentPrice
 
 	// 平仓
+	at.ensureSnapshotFromExchange(decision.Symbol, "short")
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = 全部平仓
 	if err != nil {
 		return err
@@ -1189,6 +1254,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	log.Printf("  ✓ 平仓成功")
+	at.recordRealizedTrade(decision.Symbol, "short", 0, actionRecord.Price, decision.Reasoning, true)
 	return nil
 }
 
@@ -1419,6 +1485,7 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 
 	// 执行平仓
 	var order map[string]interface{}
+	at.ensureSnapshotFromPositionMap(decision.Symbol, strings.ToLower(positionSide), targetPosition)
 	if positionSide == "LONG" {
 		order, err = at.trader.CloseLong(decision.Symbol, closeQuantity)
 	} else {
@@ -1437,6 +1504,8 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 	remainingQuantity := totalQuantity - closeQuantity
 	log.Printf("  ✓ 部分平仓成功: 平仓 %.4f (%.1f%%), 剩余 %.4f",
 		closeQuantity, decision.ClosePercentage, remainingQuantity)
+
+	at.recordRealizedTrade(decision.Symbol, strings.ToLower(positionSide), closeQuantity, actionRecord.Price, decision.Reasoning, false)
 
 	return nil
 }
@@ -1621,12 +1690,12 @@ func (at *AutoTrader) evaluatePromptRiskLimits(ctx *decision.Context, equityDrop
 	}
 
 	account := ctx.Account
-	if account.AvailableBalance > 0 && account.AvailableBalance < 10 {
-		return fmt.Sprintf("可用余额 %.2f USDT 低于 10 USDT 风险下限", account.AvailableBalance)
+	if account.PositionCount == 0 && account.AvailableBalance > 0 && account.AvailableBalance < 2 {
+		return fmt.Sprintf("可用余额 %.2f USDT 低于 2 USDT 风险下限", account.AvailableBalance)
 	}
 
-	if account.MarginUsedPct > 65 {
-		return fmt.Sprintf("保证金使用率 %.1f%% 超出 65%% 上限", account.MarginUsedPct)
+	if account.MarginUsedPct > 90 {
+		return fmt.Sprintf("保证金使用率 %.1f%% 超出 90%% 上限", account.MarginUsedPct)
 	}
 
 	if equityDropPct >= 3 {
@@ -1643,12 +1712,28 @@ func (at *AutoTrader) evaluatePromptRiskLimits(ctx *decision.Context, equityDrop
 	return ""
 }
 
+func (at *AutoTrader) isRiskPauseActive(ctx *decision.Context) bool {
+	if at.stopUntil.IsZero() || time.Now().After(at.stopUntil) {
+		at.riskPauseReason = ""
+		return false
+	}
+
+	// 可用余额恢复则立即解除
+	if strings.Contains(at.riskPauseReason, "可用余额") && ctx != nil && ctx.Account.AvailableBalance >= 10 {
+		at.stopUntil = time.Time{}
+		at.riskPauseReason = ""
+		return false
+	}
+	return true
+}
+
 func (at *AutoTrader) triggerPromptRiskPause(record *logger.DecisionRecord, reason string, currentEquity float64) {
 	pause := at.config.StopTradingTime
 	if pause <= 0 {
 		pause = 15 * time.Minute
 	}
 	at.stopUntil = time.Now().Add(pause)
+	at.riskPauseReason = reason
 
 	msg := fmt.Sprintf("⛔️ 风控触发：%s，暂停交易 %.0f 分钟", reason, pause.Minutes())
 	log.Println(msg)
@@ -1662,7 +1747,57 @@ func (at *AutoTrader) triggerPromptRiskPause(record *logger.DecisionRecord, reas
 }
 
 func (at *AutoTrader) shouldBlockLong(symbol string, data *market.Data) (bool, string) {
-	// ⚠️ 临时禁用过滤器 - 让AI prompt完全自主决策
+	if data == nil {
+		return false, ""
+	}
+
+	ltc := data.LongerTermContext
+	var emaDiffPct float64
+	var macd4h float64
+	strongDown := false
+	if ltc != nil && ltc.EMA20 > 0 && ltc.EMA50 > 0 {
+		emaDiffPct = ((ltc.EMA20 - ltc.EMA50) / ltc.EMA50) * 100
+		if ltc.EMA20 < ltc.EMA50 && emaDiffPct <= -0.6 {
+			strongDown = true
+		}
+	}
+	if ltc != nil && len(ltc.MACDValues) > 0 {
+		macd4h = ltc.MACDValues[len(ltc.MACDValues)-1]
+		if macd4h < -80 {
+			strongDown = true
+		}
+	}
+	if data.PriceChange1h < -0.2 && data.PriceChange4h < -0.5 {
+		strongDown = true
+	}
+
+	if !strongDown {
+		return false, ""
+	}
+
+	emaDeviation := 0.0
+	if data.CurrentEMA20 > 0 {
+		emaDeviation = math.Abs(data.CurrentPrice-data.CurrentEMA20) / data.CurrentEMA20 * 100
+	}
+	oversold := data.CurrentRSI7 > 0 && data.CurrentRSI7 <= 25
+	volumeConfirm := false
+	if ltc != nil && ltc.AverageVolume > 0 && ltc.CurrentVolume >= 1.2*ltc.AverageVolume {
+		volumeConfirm = true
+	}
+
+	if !oversold {
+		reason := fmt.Sprintf("强下跌趋势禁止做多: RSI7 %.2f (>25) | EMA20 %.0f < EMA50 %.0f (%.2f%%) | MACD4h %.1f",
+			data.CurrentRSI7, safeFloat(ltc, "ema20"), safeFloat(ltc, "ema50"), emaDiffPct, macd4h)
+		return true, reason
+	}
+	if emaDeviation < 0.9 && !volumeConfirm {
+		curVol := safeFloat(ltc, "curVol")
+		avgVol := safeFloat(ltc, "avgVol")
+		reason := fmt.Sprintf("强下跌趋势仅靠RSI不足: RSI7 %.2f, EMA偏离 %.2f%% (<0.9%%), 成交量 %.0f vs 均值 %.0f",
+			data.CurrentRSI7, emaDeviation, curVol, avgVol)
+		return true, reason
+	}
+
 	return false, ""
 }
 
@@ -1816,6 +1951,9 @@ func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
 			log.Printf("⚠️ [%s] 手动平仓取消止盈/止损失败 %s: %v", at.name, symbol, err)
 		}
 
+		sideLower := strings.ToLower(side)
+		at.ensureSnapshotFromPositionMap(symbol, sideLower, pos)
+
 		switch strings.ToLower(side) {
 		case "long":
 			if _, err := at.trader.CloseLong(symbol, quantity); err != nil {
@@ -1831,6 +1969,13 @@ func (at *AutoTrader) ForceCloseAllPositions(reason string) (int, error) {
 		}
 
 		closed++
+		exitPrice := getMapFloat(pos, "markPrice")
+		if exitPrice == 0 {
+			if marketData, err := market.Get(symbol); err == nil {
+				exitPrice = marketData.CurrentPrice
+			}
+		}
+		at.recordRealizedTrade(symbol, sideLower, quantity, exitPrice, reason, true)
 		log.Printf("🛑 [%s] 手动平仓 %s %s (reason=%s)", at.name, symbol, side, reason)
 	}
 
@@ -1884,6 +2029,249 @@ func extractPositionQuantity(pos map[string]interface{}) float64 {
 		}
 	}
 	return 0
+}
+
+func (at *AutoTrader) snapshotKey(symbol, side string) string {
+	return fmt.Sprintf("%s_%s", symbol, strings.ToLower(side))
+}
+
+func (at *AutoTrader) syncOpenPositionSnapshots(positions []decision.PositionInfo) {
+	for _, pos := range positions {
+		at.ensureSnapshotFromInfo(pos)
+	}
+}
+
+func (at *AutoTrader) ensureSnapshotFromInfo(pos decision.PositionInfo) *openPositionSnapshot {
+	side := strings.ToLower(pos.Side)
+	key := at.snapshotKey(pos.Symbol, side)
+	if math.Abs(pos.Quantity) < 1e-9 {
+		return nil
+	}
+
+	if snapshot, exists := at.openPositionSnapshots[key]; exists {
+		return snapshot
+	}
+
+	openTime := time.Now()
+	if pos.UpdateTime > 0 {
+		openTime = time.UnixMilli(pos.UpdateTime)
+	}
+
+	snapshot := &openPositionSnapshot{
+		EntryPrice: pos.EntryPrice,
+		Quantity:   math.Abs(pos.Quantity),
+		Leverage:   pos.Leverage,
+		OpenTime:   openTime,
+	}
+	at.openPositionSnapshots[key] = snapshot
+	return snapshot
+}
+
+func (at *AutoTrader) reconcileSnapshotsWithInfos(positionInfos []decision.PositionInfo) {
+	const epsilon = 1e-8
+	current := make(map[string]decision.PositionInfo)
+
+	for _, pos := range positionInfos {
+		side := strings.ToLower(pos.Side)
+		if side == "" {
+			continue
+		}
+
+		key := at.snapshotKey(pos.Symbol, side)
+		current[key] = pos
+
+		snapshot := at.ensureSnapshotFromInfo(pos)
+		if snapshot == nil {
+			continue
+		}
+
+		actualQty := math.Abs(pos.Quantity)
+		if snapshot.Quantity > actualQty+epsilon {
+			closedQty := snapshot.Quantity - actualQty
+			exitPrice := pos.MarkPrice
+			if exitPrice <= 0 {
+				exitPrice = pos.EntryPrice
+			}
+			at.recordRealizedTrade(pos.Symbol, side, closedQty, exitPrice, "exchange_partial_close", false)
+			snapshot.Quantity = actualQty
+		} else if actualQty > snapshot.Quantity+epsilon {
+			// position grew (shouldn't happen), align snapshot
+			snapshot.Quantity = actualQty
+			snapshot.EntryPrice = pos.EntryPrice
+			snapshot.Leverage = pos.Leverage
+		}
+	}
+
+	for key, snapshot := range at.openPositionSnapshots {
+		if _, ok := current[key]; ok {
+			continue
+		}
+
+		if snapshot == nil || snapshot.Quantity <= epsilon {
+			delete(at.openPositionSnapshots, key)
+			continue
+		}
+
+		parts := strings.SplitN(key, "_", 2)
+		if len(parts) != 2 {
+			delete(at.openPositionSnapshots, key)
+			continue
+		}
+
+		symbol := parts[0]
+		side := parts[1]
+		exitPrice, err := at.getCurrentPrice(symbol)
+		if err != nil || exitPrice <= 0 {
+			exitPrice = snapshot.EntryPrice
+		}
+
+		at.recordRealizedTrade(symbol, side, snapshot.Quantity, exitPrice, "exchange_auto_close", true)
+	}
+}
+
+func (at *AutoTrader) updateOpenSnapshot(symbol, side string, entryPrice, quantity float64, leverage int) {
+	key := at.snapshotKey(symbol, side)
+	at.openPositionSnapshots[key] = &openPositionSnapshot{
+		EntryPrice: entryPrice,
+		Quantity:   math.Abs(quantity),
+		Leverage:   leverage,
+		OpenTime:   time.Now(),
+	}
+}
+
+func (at *AutoTrader) ensureSnapshotFromPositionMap(symbol, side string, pos map[string]interface{}) *openPositionSnapshot {
+	key := at.snapshotKey(symbol, side)
+	if snapshot, exists := at.openPositionSnapshots[key]; exists {
+		return snapshot
+	}
+
+	entryPrice := getMapFloat(pos, "entryPrice")
+	if entryPrice == 0 {
+		entryPrice = getMapFloat(pos, "avgEntryPrice")
+	}
+	qty := math.Abs(getMapFloat(pos, "positionAmt"))
+	if qty == 0 {
+		qty = math.Abs(getMapFloat(pos, "quantity"))
+	}
+	leverage := int(getMapFloat(pos, "leverage"))
+	openTime := time.Now()
+	if ts, ok := at.positionFirstSeenTime[key]; ok && ts > 0 {
+		openTime = time.UnixMilli(ts)
+	}
+
+	if entryPrice == 0 || qty == 0 {
+		return nil
+	}
+
+	snapshot := &openPositionSnapshot{
+		EntryPrice: entryPrice,
+		Quantity:   qty,
+		Leverage:   leverage,
+		OpenTime:   openTime,
+	}
+	at.openPositionSnapshots[key] = snapshot
+	return snapshot
+}
+
+func (at *AutoTrader) ensureSnapshotFromExchange(symbol, side string) *openPositionSnapshot {
+	key := at.snapshotKey(symbol, side)
+	if snapshot, exists := at.openPositionSnapshots[key]; exists {
+		return snapshot
+	}
+
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		log.Printf("⚠️ [%s] 获取持仓失败，无法构建快照: %v", at.name, err)
+		return nil
+	}
+
+	for _, pos := range positions {
+		sym, _ := pos["symbol"].(string)
+		positionSide, _ := pos["side"].(string)
+		if strings.EqualFold(sym, symbol) && strings.EqualFold(positionSide, side) {
+			return at.ensureSnapshotFromPositionMap(sym, strings.ToLower(positionSide), pos)
+		}
+	}
+	return nil
+}
+
+func (at *AutoTrader) recordRealizedTrade(symbol, side string, closedQuantity float64, exitPrice float64, reason string, removeWhenZero bool) {
+	key := at.snapshotKey(symbol, side)
+	snapshot, exists := at.openPositionSnapshots[key]
+	if !exists || snapshot == nil || snapshot.Quantity <= 0 {
+		log.Printf("⚠️ [%s] 无法记录成交，缺少持仓快照: %s (%s)", at.name, symbol, side)
+		return
+	}
+
+	qty := closedQuantity
+	if qty <= 0 || qty > snapshot.Quantity+1e-9 {
+		qty = snapshot.Quantity
+	}
+
+	entryPrice := snapshot.EntryPrice
+	leverage := snapshot.Leverage
+	openTime := snapshot.OpenTime
+	positionValue := entryPrice * qty
+	marginUsed := 0.0
+	if leverage > 0 {
+		marginUsed = positionValue / float64(leverage)
+	}
+
+	var pnl float64
+	if side == "long" {
+		pnl = (exitPrice - entryPrice) * qty
+	} else {
+		pnl = (entryPrice - exitPrice) * qty
+	}
+
+	pnlPct := 0.0
+	if marginUsed > 0 {
+		pnlPct = (pnl / marginUsed) * 100
+	}
+
+	snapshot.Quantity -= qty
+	if snapshot.Quantity <= 1e-8 || removeWhenZero {
+		delete(at.openPositionSnapshots, key)
+		delete(at.positionFirstSeenTime, key)
+	}
+
+	at.saveTradeHistory(symbol, side, leverage, qty, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed, openTime, time.Now(), reason)
+}
+
+func (at *AutoTrader) saveTradeHistory(symbol, side string, leverage int, quantity, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed float64, openTime, closeTime time.Time, reason string) {
+	recorder, ok := at.database.(tradeHistoryRecorder)
+	if !ok || recorder == nil {
+		return
+	}
+	if err := recorder.RecordTradeHistory(at.id, symbol, side, leverage, quantity, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed, openTime, closeTime, reason); err != nil {
+		log.Printf("⚠️ [%s] 记录历史成交失败: %v", at.name, err)
+	}
+}
+
+func (at *AutoTrader) getCurrentPrice(symbol string) (float64, error) {
+	marketData, err := market.Get(symbol)
+	if err != nil {
+		return 0, err
+	}
+	return marketData.CurrentPrice, nil
+}
+
+func safeFloat(ltc *market.LongerTermData, field string) float64 {
+	if ltc == nil {
+		return 0
+	}
+	switch field {
+	case "ema20":
+		return ltc.EMA20
+	case "ema50":
+		return ltc.EMA50
+	case "curVol":
+		return ltc.CurrentVolume
+	case "avgVol":
+		return ltc.AverageVolume
+	default:
+		return 0
+	}
 }
 
 func (at *AutoTrader) applyQuantityFromNotional(decision *decision.Decision, price float64) {
@@ -2259,17 +2647,25 @@ func (at *AutoTrader) checkPositionDrawdown() {
 func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	switch side {
 	case "long":
+		at.ensureSnapshotFromExchange(symbol, "long")
 		order, err := at.trader.CloseLong(symbol, 0) // 0 = 全部平仓
 		if err != nil {
 			return err
 		}
 		log.Printf("✅ 紧急平多仓成功，订单ID: %v", order["orderId"])
+		if price, err := at.getCurrentPrice(symbol); err == nil {
+			at.recordRealizedTrade(symbol, "long", 0, price, "drawdown_auto_close", true)
+		}
 	case "short":
+		at.ensureSnapshotFromExchange(symbol, "short")
 		order, err := at.trader.CloseShort(symbol, 0) // 0 = 全部平仓
 		if err != nil {
 			return err
 		}
 		log.Printf("✅ 紧急平空仓成功，订单ID: %v", order["orderId"])
+		if price, err := at.getCurrentPrice(symbol); err == nil {
+			at.recordRealizedTrade(symbol, "short", 0, price, "drawdown_auto_close", true)
+		}
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
 	}

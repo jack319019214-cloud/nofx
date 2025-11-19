@@ -39,6 +39,7 @@ type DatabaseInterface interface {
 	UpdateTraderCustomPrompt(userID, id string, customPrompt string, overrideBase bool) error
 	DeleteTrader(userID, id string) error
 	GetTraderConfig(userID, traderID string) (*TraderRecord, *AIModelConfig, *ExchangeConfig, error)
+	RecordTradeHistory(traderID, symbol, side string, leverage int, quantity, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed float64, openTime, closeTime time.Time, reason string) error
 	GetSystemConfig(key string) (string, error)
 	SetSystemConfig(key, value string) error
 	CreateUserSignalSource(userID, coinPoolURL, oiTopURL string) error
@@ -54,7 +55,7 @@ type DatabaseInterface interface {
 
 // Database 配置数据库
 type Database struct {
-	db           *sql.DB
+	db            *sql.DB
 	cryptoService *crypto.CryptoService
 }
 
@@ -147,6 +148,29 @@ func (d *Database) createTables() error {
 			FOREIGN KEY (ai_model_id) REFERENCES ai_models(id),
 			FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
 		)`,
+
+		// 历史成交记录表
+		`CREATE TABLE IF NOT EXISTS trade_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			trader_id TEXT NOT NULL,
+			symbol TEXT NOT NULL,
+			side TEXT NOT NULL,
+			leverage INTEGER DEFAULT 0,
+			quantity REAL DEFAULT 0,
+			entry_price REAL DEFAULT 0,
+			exit_price REAL DEFAULT 0,
+			position_value REAL DEFAULT 0,
+			margin_used REAL DEFAULT 0,
+			pnl REAL DEFAULT 0,
+			pnl_pct REAL DEFAULT 0,
+			open_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+			close_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+			reason TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (trader_id) REFERENCES traders(id) ON DELETE CASCADE
+		)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_trade_history_trader ON trade_history(trader_id, close_time)`,
 
 		// 用户表
 		`CREATE TABLE IF NOT EXISTS users (
@@ -756,12 +780,12 @@ func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// 解密敏感字段
 		exchange.APIKey = d.decryptSensitiveData(exchange.APIKey)
 		exchange.SecretKey = d.decryptSensitiveData(exchange.SecretKey)
 		exchange.AsterPrivateKey = d.decryptSensitiveData(exchange.AsterPrivateKey)
-		
+
 		exchanges = append(exchanges, &exchange)
 	}
 
@@ -853,7 +877,7 @@ func (d *Database) CreateExchange(userID, id, name, typ string, enabled bool, ap
 	encryptedAPIKey := d.encryptSensitiveData(apiKey)
 	encryptedSecretKey := d.encryptSensitiveData(secretKey)
 	encryptedAsterPrivateKey := d.encryptSensitiveData(asterPrivateKey)
-	
+
 	_, err := d.db.Exec(`
 		INSERT OR IGNORE INTO exchanges (id, user_id, name, type, enabled, api_key, secret_key, testnet, hyperliquid_wallet_addr, aster_user, aster_signer, aster_private_key) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -945,6 +969,17 @@ func (d *Database) UpdateTraderInitialBalance(userID, id string, newBalance floa
 // DeleteTrader 删除交易员
 func (d *Database) DeleteTrader(userID, id string) error {
 	_, err := d.db.Exec(`DELETE FROM traders WHERE id = ? AND user_id = ?`, id, userID)
+	return err
+}
+
+// RecordTradeHistory 记录历史成交
+func (d *Database) RecordTradeHistory(traderID, symbol, side string, leverage int, quantity, entryPrice, exitPrice, pnl, pnlPct, positionValue, marginUsed float64, openTime, closeTime time.Time, reason string) error {
+	_, err := d.db.Exec(`
+		INSERT INTO trade_history (
+			trader_id, symbol, side, leverage, quantity, entry_price, exit_price, position_value,
+			margin_used, pnl, pnl_pct, open_time, close_time, reason
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, traderID, symbol, side, leverage, quantity, entryPrice, exitPrice, positionValue, marginUsed, pnl, pnlPct, openTime.UTC(), closeTime.UTC(), reason)
 	return err
 }
 
@@ -1200,13 +1235,13 @@ func (d *Database) encryptSensitiveData(plaintext string) string {
 	if d.cryptoService == nil || plaintext == "" {
 		return plaintext
 	}
-	
+
 	encrypted, err := d.cryptoService.EncryptForStorage(plaintext)
 	if err != nil {
 		log.Printf("⚠️ 加密失败: %v", err)
 		return plaintext // 返回明文作为降级处理
 	}
-	
+
 	return encrypted
 }
 
@@ -1215,17 +1250,17 @@ func (d *Database) decryptSensitiveData(encrypted string) string {
 	if d.cryptoService == nil || encrypted == "" {
 		return encrypted
 	}
-	
+
 	// 如果不是加密格式，直接返回
 	if !d.cryptoService.IsEncryptedStorageValue(encrypted) {
 		return encrypted
 	}
-	
+
 	decrypted, err := d.cryptoService.DecryptFromStorage(encrypted)
 	if err != nil {
 		log.Printf("⚠️ 解密失败: %v", err)
 		return encrypted // 返回加密文本作为降级处理
 	}
-	
+
 	return decrypted
 }

@@ -73,17 +73,21 @@ type OITopData struct {
 
 // Context 交易上下文（传递给AI的完整信息）
 type Context struct {
-	CurrentTime     string                  `json:"current_time"`
-	RuntimeMinutes  int                     `json:"runtime_minutes"`
-	CallCount       int                     `json:"call_count"`
-	Account         AccountInfo             `json:"account"`
-	Positions       []PositionInfo          `json:"positions"`
-	CandidateCoins  []CandidateCoin         `json:"candidate_coins"`
-	MarketDataMap   map[string]*market.Data `json:"-"` // 不序列化，但内部使用
-	OITopDataMap    map[string]*OITopData   `json:"-"` // OI Top数据映射
-	Performance     interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
-	BTCETHLeverage  int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
-	AltcoinLeverage int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	CurrentTime        string                  `json:"current_time"`
+	RuntimeMinutes     int                     `json:"runtime_minutes"`
+	CallCount          int                     `json:"call_count"`
+	Account            AccountInfo             `json:"account"`
+	FlatCycles         int                     `json:"flat_cycles"`
+	FlatSince          string                  `json:"flat_since"`
+	FlatRelaxActive    bool                    `json:"flat_relax_active"`
+	FlatRelaxThreshold int                     `json:"flat_relax_threshold"`
+	Positions          []PositionInfo          `json:"positions"`
+	CandidateCoins     []CandidateCoin         `json:"candidate_coins"`
+	MarketDataMap      map[string]*market.Data `json:"-"` // 不序列化，但内部使用
+	OITopDataMap       map[string]*OITopData   `json:"-"` // OI Top数据映射
+	Performance        interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
+	BTCETHLeverage     int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
+	AltcoinLeverage    int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
 }
 
 // Decision AI的交易决策
@@ -446,6 +450,19 @@ func buildUserPrompt(ctx *Context) string {
 		ctx.Account.TotalPnLPct,
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
+
+	if ctx.FlatCycles > 0 {
+		mode := "关闭"
+		if ctx.FlatRelaxActive {
+			mode = "开启"
+		}
+		since := ""
+		if ctx.FlatSince != "" {
+			since = fmt.Sprintf(" | 起始: %s", ctx.FlatSince)
+		}
+		sb.WriteString(fmt.Sprintf("连续空仓: %d 周期 (阈值 %d) | 空仓超时模式: %s%s\n\n",
+			ctx.FlatCycles, ctx.FlatRelaxThreshold, mode, since))
+	}
 
 	// 持仓（完整市场数据）
 	if len(ctx.Positions) > 0 {
